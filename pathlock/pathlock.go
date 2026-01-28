@@ -259,6 +259,15 @@ func cleanFilePath(p string) string {
 	return cleanSlashPath(p)
 }
 
+// UnifyFilePath cleans and unifies a
+// Windows file path.
+//
+// This is intended to be used by other module in a
+// way that is uniform with the pathlock package.
+func UnifyFilePath(p string) string {
+	return filepath.FromSlash(cleanFilePath(p))
+}
+
 // RLock attempt to perform the reader lock on the path.
 func (l *PathLocker) RLock(p string) *Lock {
 	return l.readLockCleanPath(cleanFilePath(p))

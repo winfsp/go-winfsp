@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -48,6 +49,80 @@ type fileHandle struct {
 	evaluatedIndex uint64
 }
 
+// AttribReadOnlyTransMode controls how gofs
+// translate the `FILE_ATTRIBUTE_READONLY`
+// flag of a file.
+//
+// The `FILE_ATTRIBUTE_NORMAL` flag is not
+// applicable to a directory, according to
+// the Windows API. Therefore gofs will always
+// clear this bit when it is a directory.
+//
+// Please notice while setting the read-only
+// flag could make the file non-writable and
+// non-deletable, it's all due to the Windows
+// file system and WinFSP, and gofs performs
+// **no** permission check internally. Therefore,
+// one must **never** rely on gofs to grate
+// unauthorized accesses, it's the duty for
+// for `gofs.File` and `gofs.FileSystem`.
+//
+// The default value is `AttribReadOnlyWindows`.
+type AttribReadOnlyTransMode uint64
+
+const (
+	// AttribReadOnlyWindows make gofs translate
+	// the read-only attribute based on the
+	// Windows semantics.
+	//
+	// That is, when `os.FileInfo.Mode()` has no
+	// writable bit set for the current user,
+	// it is viewed as read-only, rendering the
+	// file as not writable to and deletable.
+	// This is the way go os package translate
+	// the permission bit on Windows platform.
+	AttribReadOnlyWindows AttribReadOnlyTransMode = 0
+
+	// AttribReadOnlyBypass make gofs clear
+	// the read-only attribute indefinitely.
+	AttribReadOnlyBypass AttribReadOnlyTransMode = 1
+
+	// AttribReadOnlyAlways make gofs set
+	// the read-only attribute indefinitely.
+	AttribReadOnlyAlways AttribReadOnlyTransMode = 2
+
+	// AttribReadOnlyPOSIX make gofs translate
+	// the read-only attribute based on the
+	// POSIX semantics.
+	//
+	// The translation is based on `os.FileInfo.Mode()`
+	// of the current file and its parent directory.
+	// The bit is set only if both the file
+	// and the parent directory has no writable
+	// bit set for the current user.
+	AttribReadOnlyPOSIX AttribReadOnlyTransMode = 3
+
+	AttribReadOnlyAllStyleBits = AttribReadOnlyTransMode(0) |
+		AttribReadOnlyWindows |
+		AttribReadOnlyBypass |
+		AttribReadOnlyAlways |
+		AttribReadOnlyPOSIX
+
+	// AttribReadOnlyHonorSys make gofs honor
+	// the `FileAttributes` field when `os.FileInfo.Sys()`
+	// is `syscall.Win32FileAttributeData`.
+	//
+	// If `os.FileInfo.Sys()` is nil or not a
+	// `syscall.Win32FileAttributeData`, it we will
+	// fallback to the handling logic due to
+	// `AttribReadOnlyAllStyleBits`.
+	AttribReadOnlyHonorSys AttribReadOnlyTransMode = 4
+
+	AttribReadOnlyAllBits = AttribReadOnlyTransMode(0) |
+		AttribReadOnlyAllStyleBits |
+		AttribReadOnlyHonorSys
+)
+
 type fileSystem struct {
 	inner   FileSystem
 	handles sync.Map
@@ -55,6 +130,8 @@ type fileSystem struct {
 
 	labelLen int
 	label    [32]uint16
+
+	readOnlyTransMode AttribReadOnlyTransMode
 }
 
 func (handle *fileHandle) reopenFile(fs *fileSystem) (File, error) {
@@ -62,13 +139,56 @@ func (handle *fileHandle) reopenFile(fs *fileSystem) (File, error) {
 		handle.lock.FilePath(), handle.flags, os.FileMode(0))
 }
 
-func attributesFromFileMode(mode os.FileMode) uint32 {
+func (fs *fileSystem) readOnlyBitFromSelfParentStats(
+	selfStat, parentStat os.FileInfo,
+) uint32 {
+	if (fs.readOnlyTransMode & AttribReadOnlyHonorSys) != 0 {
+		var attribData *syscall.Win32FileAttributeData
+		if sys := selfStat.Sys(); sys != nil {
+			if v, ok := sys.(*syscall.Win32FileAttributeData); ok {
+				attribData = v
+			}
+		}
+		if attribData != nil {
+			return attribData.FileAttributes & windows.FILE_ATTRIBUTE_READONLY
+		}
+	}
+	mode := selfStat.Mode()
+	switch fs.readOnlyTransMode & AttribReadOnlyAllStyleBits {
+	case AttribReadOnlyBypass:
+		return 0
+	case AttribReadOnlyAlways:
+		return windows.FILE_ATTRIBUTE_READONLY
+	case AttribReadOnlyPOSIX:
+		selfWritable := (uint32(mode.Perm()) & 0200) != 0
+		parentMode := os.FileMode(0)
+		if parentStat != nil {
+			parentMode = parentStat.Mode()
+		}
+		parentWritable := (uint32(parentMode.Perm()) & 0200) != 0
+		if selfWritable || parentWritable {
+			return 0
+		}
+		return windows.FILE_ATTRIBUTE_READONLY
+	case AttribReadOnlyWindows:
+		fallthrough
+	default:
+		if (uint32(mode.Perm()) & 0200) != 0 {
+			return 0
+		}
+		return windows.FILE_ATTRIBUTE_READONLY
+	}
+}
+
+func (fs *fileSystem) attributesFromSelfParentStats(
+	selfStat, parentStat os.FileInfo,
+) uint32 {
+	mode := selfStat.Mode()
 	var attributes uint32
 	if mode.IsDir() {
 		attributes |= windows.FILE_ATTRIBUTE_DIRECTORY
-	}
-	if (uint32(mode.Perm()) & 0200) == 0 {
-		attributes |= windows.FILE_ATTRIBUTE_READONLY
+	} else if mode.IsRegular() {
+		attributes |= fs.readOnlyBitFromSelfParentStats(selfStat, parentStat)
 	}
 	if attributes == 0 {
 		attributes = windows.FILE_ATTRIBUTE_NORMAL
@@ -76,15 +196,107 @@ func attributesFromFileMode(mode os.FileMode) uint32 {
 	return attributes
 }
 
+func (fs *fileSystem) fillInfoFromSelfParentStats(
+	target *winfsp.FSP_FSCTL_FILE_INFO,
+	selfStat, parentStat os.FileInfo,
+	evaluatedIndexNumber uint64,
+) {
+	target.FileAttributes = fs.attributesFromSelfParentStats(selfStat, parentStat)
+	target.ReparseTag = 0
+	target.FileSize = uint64(selfStat.Size())
+	target.AllocationSize = ((target.FileSize + 4095) / 4096) * 4096
+	target.CreationTime = filetime.Timestamp(selfStat.ModTime())
+	target.LastAccessTime = target.CreationTime
+	target.LastWriteTime = target.CreationTime
+	target.ChangeTime = target.LastWriteTime
+	target.IndexNumber = evaluatedIndexNumber
+	target.HardLinks = 0
+	target.EaSize = 0
+
+	// We can extract more data from it if it is find data from
+	// windows, which is the one from golang's standard library.
+	sys := selfStat.Sys()
+	if sys == nil {
+		return
+	}
+	findData, ok := sys.(*syscall.Win32FileAttributeData)
+	if !ok {
+		return
+	}
+	target.CreationTime = filetime.Filetime(findData.CreationTime)
+	target.LastAccessTime = filetime.Filetime(findData.LastAccessTime)
+	target.LastWriteTime = filetime.Filetime(findData.LastWriteTime)
+	target.ChangeTime = target.LastWriteTime
+}
+
+func (fs *fileSystem) needParentStat() bool {
+	switch fs.readOnlyTransMode & AttribReadOnlyAllStyleBits {
+	case AttribReadOnlyPOSIX:
+		return true
+	}
+	return false
+}
+
+func (fs *fileSystem) fillInfoFromPath(
+	target *winfsp.FSP_FSCTL_FILE_INFO,
+	path string,
+	selfStat, parentStat os.FileInfo,
+	evaluatedIndexNumber uint64,
+) error {
+	var err error
+	if selfStat == nil {
+		if selfStat, err = fs.inner.Stat(path); err != nil {
+			return err
+		}
+	}
+	if parentStat == nil && fs.needParentStat() {
+		parent := filepath.Dir(pathlock.UnifyFilePath(path))
+		parent = pathlock.UnifyFilePath(parent)
+		if parentStat, err = fs.inner.Stat(parent); err != nil {
+			return err
+		}
+	}
+	fs.fillInfoFromSelfParentStats(
+		target, selfStat, parentStat, evaluatedIndexNumber,
+	)
+	return nil
+}
+
+func (fs *fileSystem) fillInfoFromHandle(
+	target *winfsp.FSP_FSCTL_FILE_INFO,
+	handle *fileHandle,
+	selfStat, parentStat os.FileInfo,
+) error {
+	var err error
+	if selfStat == nil && handle.file != nil {
+		selfStat, err = handle.file.Stat()
+		if err != nil {
+			return err
+		}
+	}
+	return fs.fillInfoFromPath(
+		target, handle.lock.FilePath(),
+		selfStat, parentStat,
+		handle.evaluatedIndex,
+	)
+}
+
 func (fs *fileSystem) GetSecurityByName(
 	ref *winfsp.FileSystemRef, name string,
 	flags winfsp.GetSecurityByNameFlags,
 ) (uint32, *windows.SECURITY_DESCRIPTOR, error) {
+	var err error
+	name = pathlock.UnifyFilePath(name)
 	info, err := fs.inner.Stat(name)
 	if err != nil || flags == winfsp.GetExistenceOnly {
 		return 0, nil, err
 	}
-	attributes := attributesFromFileMode(info.Mode())
+	target := &winfsp.FSP_FSCTL_FILE_INFO{}
+	err = fs.fillInfoFromPath(target, name, info, nil, 0)
+	if err != nil || flags == winfsp.GetAttributesByName {
+		return 0, nil, err
+	}
+	attributes := target.FileAttributes
 	var sd *windows.SECURITY_DESCRIPTOR
 	if (flags & winfsp.GetSecurityByName) != 0 {
 		// XXX: this is a mock up, the file is considered to
@@ -112,38 +324,6 @@ func evaluateIndexNumber(p string) uint64 {
 	c := binary.BigEndian.Uint64(data[16:24])
 	d := binary.BigEndian.Uint64(data[24:32])
 	return a ^ b ^ c ^ d
-}
-
-func fileInfoFromStat(
-	target *winfsp.FSP_FSCTL_FILE_INFO, source os.FileInfo,
-	evaluatedIndexNumber uint64,
-) {
-	target.FileAttributes = attributesFromFileMode(source.Mode())
-	target.ReparseTag = 0
-	target.FileSize = uint64(source.Size())
-	target.AllocationSize = ((target.FileSize + 4095) / 4096) * 4096
-	target.CreationTime = filetime.Timestamp(source.ModTime())
-	target.LastAccessTime = target.CreationTime
-	target.LastWriteTime = target.CreationTime
-	target.ChangeTime = target.LastWriteTime
-	target.IndexNumber = evaluatedIndexNumber
-	target.HardLinks = 0
-	target.EaSize = 0
-
-	// We can extract more data from it if it is find data from
-	// windows, which is the one from golang's standard library.
-	sys := source.Sys()
-	if sys == nil {
-		return
-	}
-	findData, ok := sys.(*syscall.Win32FileAttributeData)
-	if !ok {
-		return
-	}
-	target.CreationTime = filetime.Filetime(findData.CreationTime)
-	target.LastAccessTime = filetime.Filetime(findData.LastAccessTime)
-	target.LastWriteTime = filetime.Filetime(findData.LastWriteTime)
-	target.ChangeTime = target.LastWriteTime
 }
 
 const (
@@ -181,6 +361,7 @@ func (fs *fileSystem) openFile(
 	if createOptions&bothDirectoryFlags == bothDirectoryFlags {
 		return 0, windows.STATUS_INVALID_PARAMETER
 	}
+	var err error
 
 	// Determine the current access flag for writer here.
 	flags := 0
@@ -358,7 +539,13 @@ func (fs *fileSystem) openFile(
 	handle.evaluatedIndex = evaluateIndexNumber(lock.Path())
 
 	// Copy the status out to the file information block.
-	fileInfoFromStat(info, fileInfo, handle.evaluatedIndex)
+	//
+	// XXX: This must always be done after all fields in
+	// the handle are filled.
+	err = fs.fillInfoFromHandle(info, handle, fileInfo, nil)
+	if err != nil {
+		return 0, err
+	}
 
 	// Finish opening the file and return to the caller.
 	created = true
@@ -450,6 +637,7 @@ func (fs *fileSystem) Overwrite(
 	allocationSize uint64,
 	info *winfsp.FSP_FSCTL_FILE_INFO,
 ) error {
+	var err error
 	handle, err := fs.load(file)
 	if err != nil {
 		return err
@@ -465,11 +653,10 @@ func (fs *fileSystem) Overwrite(
 	//
 	// It might seems like we are just ignoring the attribute
 	// update but we might support them in the future.
-	fileInfo, err := handle.file.Stat()
+	err = fs.fillInfoFromHandle(info, handle, nil, nil)
 	if err != nil {
 		return err
 	}
-	fileInfoFromStat(info, fileInfo, handle.evaluatedIndex)
 	return nil
 }
 
@@ -502,13 +689,17 @@ func (fs *fileSystem) ReadDirectory(
 		return err
 	}
 	defer func() { _ = f.Close() }()
+	parentInfo, err := f.Stat()
+	if err != nil {
+		return err
+	}
 	fileInfos, err := f.Readdir(-1)
 	if err != nil {
 		return err
 	}
 	for _, fileInfo := range fileInfos {
 		var info winfsp.FSP_FSCTL_FILE_INFO
-		fileInfoFromStat(&info, fileInfo, 0)
+		fs.fillInfoFromSelfParentStats(&info, fileInfo, parentInfo, 0)
 		ok, err := fill(fileInfo.Name(), &info)
 		if err != nil || !ok {
 			return err
@@ -531,12 +722,7 @@ func (fs *fileSystem) GetFileInfo(
 		return err
 	}
 	defer handle.unlockChecked()
-	fileInfo, err := handle.file.Stat()
-	if err != nil {
-		return err
-	}
-	fileInfoFromStat(info, fileInfo, handle.evaluatedIndex)
-	return nil
+	return fs.fillInfoFromHandle(info, handle, nil, nil)
 }
 
 var _ winfsp.BehaviourGetFileInfo = (*fileSystem)(nil)
@@ -587,6 +773,7 @@ func (fs *fileSystem) SetBasicInfo(
 	creationTime, lastAccessTime, lastWriteTime, changeTime uint64,
 	info *winfsp.FSP_FSCTL_FILE_INFO,
 ) error {
+	var err error
 	handle, err := fs.load(file)
 	if err != nil {
 		return err
@@ -595,11 +782,10 @@ func (fs *fileSystem) SetBasicInfo(
 		return err
 	}
 	defer handle.unlockChecked()
-	fileInfo, err := handle.file.Stat()
+	err = fs.fillInfoFromHandle(info, handle, nil, nil)
 	if err != nil {
 		return err
 	}
-	fileInfoFromStat(info, fileInfo, handle.evaluatedIndex)
 	return windows.STATUS_ACCESS_DENIED
 }
 
@@ -663,12 +849,7 @@ func (fs *fileSystem) SetFileSize(
 			return err
 		}
 	}
-	fileInfo, err := handle.file.Stat()
-	if err != nil {
-		return err
-	}
-	fileInfoFromStat(info, fileInfo, handle.evaluatedIndex)
-	return nil
+	return fs.fillInfoFromHandle(info, handle, nil, nil)
 }
 
 var _ winfsp.BehaviourSetFileSize = (*fileSystem)(nil)
@@ -789,15 +970,18 @@ func (fs *fileSystem) Write(
 	} else {
 		n, err = handle.file.WriteAt(b, int64(offset))
 	}
-	fileInfo, statErr := handle.file.Stat()
-	if statErr != nil && err == nil {
-		err = statErr
-	}
-	if fileInfo != nil {
-		// XXX: since the driver code just take the information
+	if info != nil {
+		// XXX: Since the driver code just take the information
 		// field for notification and display purpose, so only
 		// the lastly updated information is required.
-		fileInfoFromStat(info, fileInfo, handle.evaluatedIndex)
+		//
+		// TODO: What pieces of information is required by the
+		// driver? Can we optimize the number of `Stat`s if
+		// the FileAttributes is actually not needed?
+		statErr := fs.fillInfoFromHandle(info, handle, nil, nil)
+		if statErr != nil && err == nil {
+			err = statErr
+		}
 	}
 	return n, err
 }
@@ -823,12 +1007,9 @@ func (fs *fileSystem) Flush(
 	if err := handle.file.Sync(); err != nil {
 		return err
 	}
-	fileInfo, err := handle.file.Stat()
-	if err != nil {
-		return err
-	}
-	fileInfoFromStat(info, fileInfo, handle.evaluatedIndex)
-	return nil
+	// TODO: Again, is it the same case as `Stat`-ing
+	// in the Write method?
+	return fs.fillInfoFromHandle(info, handle, nil, nil)
 }
 
 var _ winfsp.BehaviourFlush = (*fileSystem)(nil)
@@ -984,8 +1165,65 @@ func (fs *fileSystem) Rename(
 
 var _ winfsp.BehaviourRename = (*fileSystem)(nil)
 
-func New(fs FileSystem) winfsp.BehaviourBase {
-	return &fileSystem{
-		inner: fs,
+type newOption struct {
+	attribReadOnlyTransMode AttribReadOnlyTransMode
+}
+
+// NewOption is the optional option used to
+// initialize the gofs.
+type NewOption func(*newOption) error
+
+func WithAttribReadOnlyTransMode(mode AttribReadOnlyTransMode) NewOption {
+	return func(option *newOption) (rerr error) {
+		defer func() {
+			if rerr == nil {
+				return
+			}
+			rerr = errors.Wrapf(
+				rerr, "apply WithAttribReadOnlyTransMode(%d)", uint64(mode),
+			)
+		}()
+		if (mode & AttribReadOnlyAllBits) != mode {
+			return errors.New("invalid attribute bits")
+		}
+		switch mode & AttribReadOnlyAllStyleBits {
+		case AttribReadOnlyWindows:
+		case AttribReadOnlyBypass:
+		case AttribReadOnlyAlways:
+		case AttribReadOnlyPOSIX:
+		default:
+			return errors.New("invalid style")
+		}
+		option.attribReadOnlyTransMode = mode
+		return nil
 	}
+}
+
+// NewOptions create the file system with
+// the provided `gofs.FileSystem` and a
+// variadic array of options.
+func NewOptions(
+	fs FileSystem, opts ...NewOption,
+) (winfsp.BehaviourBase, error) {
+	var option newOption
+	for _, opt := range opts {
+		if err := opt(&option); err != nil {
+			return nil, err
+		}
+	}
+	return &fileSystem{
+		inner:             fs,
+		readOnlyTransMode: option.attribReadOnlyTransMode,
+	}, nil
+}
+
+// New create the file system with the
+// provided `gofs.FileSystem` and default
+// settings, which is guaranteed to success.
+func New(fs FileSystem) winfsp.BehaviourBase {
+	result, err := NewOptions(fs)
+	if err != nil {
+		panic(err)
+	}
+	return result
 }
