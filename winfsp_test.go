@@ -25,7 +25,13 @@ func TestMount(t *testing.T) {
 	testFS.addTestFile(`\reg-size-456`, bytes.Repeat([]byte{'a'}, 456))
 	testFS.addTestFile(`\hello.txt`, []byte(helloWorld))
 
-	bb := gofs.New(testFS)
+	bb, err := gofs.NewOptions(
+		testFS,
+		gofs.WithAttribReadOnlyTransMode(gofs.AttribReadOnlyPOSIX),
+	)
+	if err != nil {
+		t.Fatalf("NewOptions: %v", err)
+	}
 	fspFS, err := winfsp.Mount(bb, "T:")
 	if err != nil {
 		t.Fatalf("Mount: %v", err)
@@ -93,8 +99,6 @@ func TestMount(t *testing.T) {
 	})
 
 	t.Run("RemoveFile", func(t *testing.T) {
-		t.Skip("TODO: make this test pass") // os.Remove is failing with access denied
-
 		const path = `T:\to-delete.txt`
 		wantNotExist(t, path)
 		if err := os.WriteFile(path, []byte(helloWorld), 0o666); err != nil {

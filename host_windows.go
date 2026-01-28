@@ -1611,9 +1611,7 @@ func FileSystemAddDirInfo(
 	}
 
 	di := (*FSP_FSCTL_DIR_INFO)(unsafe.Pointer(&buffer[0]))
-	if fileInfo != nil {
-		di.FileInfo = *fileInfo
-	}
+	di.FileInfo = *fileInfo
 	di.NextOffset = nextOffset
 	di.Padding0 = 0
 	di.Padding1 = 0
