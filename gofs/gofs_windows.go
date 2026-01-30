@@ -31,6 +31,8 @@ type File interface {
 	Truncate(size int64) error
 }
 
+var _ File = (*os.File)(nil)
+
 type FileSystem interface {
 	OpenFile(name string, flag int, perm os.FileMode) (File, error)
 	Mkdir(name string, perm os.FileMode) error
