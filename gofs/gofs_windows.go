@@ -342,8 +342,7 @@ const (
 		windows.FILE_OPEN_BY_FILE_ID |
 		windows.FILE_RESERVE_OPFILTER |
 		windows.FILE_OPEN_REQUIRING_OPLOCK |
-		windows.FILE_COMPLETE_IF_OPLOCKED |
-		windows.FILE_OPEN_NO_RECALL
+		windows.FILE_COMPLETE_IF_OPLOCKED
 
 	// bothDirectoryFlags are the flags of directory or-ing
 	// the non directory flags. If both flags are set, this
