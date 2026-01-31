@@ -2072,9 +2072,92 @@ func BinPath() (string, error) {
 	return filepath.Join(syscall.UTF16ToString(path), "bin"), nil
 }
 
+func loadSignedDLL(dllPath string) (*syscall.DLL, error) {
+	var err error
+	absDLLPath, err := filepath.Abs(dllPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "resolve path %q", dllPath)
+	}
+	dllPath = absDLLPath
+
+	u16Path, err := syscall.UTF16PtrFromString(dllPath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "encode path %q", dllPath)
+	}
+
+	fh, err := windows.CreateFile(
+		u16Path,
+		windows.FILE_GENERIC_READ,
+		// Forbid other process from WRITE|DELETE.
+		windows.FILE_SHARE_READ,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_OPEN_REPARSE_POINT|windows.FILE_NON_DIRECTORY_FILE,
+		windows.Handle(0),
+	)
+	if err != nil {
+		return nil, errors.Wrapf(err, "open file %q", dllPath)
+	}
+	defer windows.CloseHandle(fh)
+
+	var winTrustFileInfo windows.WinTrustFileInfo
+	winTrustFileInfo.Size = uint32(unsafe.Sizeof(winTrustFileInfo))
+	winTrustFileInfo.File = fh
+	winTrustFileInfo.KnownSubject = nil
+
+	var winTrustData windows.WinTrustData
+	winTrustData.Size = uint32(unsafe.Sizeof(winTrustData))
+	winTrustData.PolicyCallbackData = uintptr(0)
+	winTrustData.SIPClientData = uintptr(0)
+	winTrustData.UIChoice = windows.WTD_UI_NONE
+	winTrustData.RevocationChecks = windows.WTD_REVOKE_WHOLECHAIN
+	winTrustData.StateAction = windows.WTD_STATEACTION_VERIFY
+	winTrustData.StateData = windows.Handle(0)
+	winTrustData.URLReference = nil
+	winTrustData.UIContext = 0
+
+	winTrustData.FileOrCatalogOrBlobOrSgnrOrCert = unsafe.Pointer(&winTrustFileInfo)
+	winTrustData.UnionChoice = windows.WTD_CHOICE_FILE
+
+	err = windows.WinVerifyTrustEx(
+		windows.InvalidHWND,
+		&windows.WINTRUST_ACTION_GENERIC_VERIFY_V2,
+		&winTrustData,
+	)
+	defer func() {
+		winTrustData.StateAction = windows.WTD_STATEACTION_CLOSE
+		_ = windows.WinVerifyTrustEx(
+			windows.InvalidHWND,
+			&windows.WINTRUST_ACTION_GENERIC_VERIFY_V2,
+			&winTrustData,
+		)
+	}()
+	if err != nil {
+		return nil, errors.Wrapf(err, "verify signature %q", dllPath)
+	}
+
+	// XXX: the dependency DLLs of WinFSP is still prone to
+	// DLL hijacking, but protecting WinFSP DLL directory
+	// is now the responsibility of user.
+	hdll, err := windows.LoadLibraryEx(
+		dllPath, windows.Handle(0),
+		windows.LOAD_LIBRARY_SEARCH_SYSTEM32|windows.LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+	)
+	if err != nil {
+		return nil, errors.Wrapf(err, "load library %q", dllPath)
+	}
+	return &syscall.DLL{
+		Name:   dllPath,
+		Handle: syscall.Handle(hdll),
+	}, nil
+}
+
 // loadWinFSPDLL attempts to locate and load the DLL, the
 // library handle will be available from now on.
 func loadWinFSPDLL() (*syscall.DLL, error) {
+	if winFSPDLL != nil {
+		return winFSPDLL, nil
+	}
 	dllName := ""
 	switch runtime.GOARCH {
 	case "arm64":
@@ -2090,16 +2173,12 @@ func loadWinFSPDLL() (*syscall.DLL, error) {
 		return nil, errors.Errorf(
 			"winfsp unsupported arch %q", runtime.GOARCH)
 	}
-	dll, _ := syscall.LoadDLL(dllName)
-	if dll != nil {
-		return dll, nil
-	}
+
 	installPath, err := BinPath()
 	if err != nil {
 		return nil, err
 	}
-	// Attempt to load the DLL that we have found.
-	return syscall.LoadDLL(filepath.Join(installPath, dllName))
+	return loadSignedDLL(filepath.Join(installPath, dllName))
 }
 
 // dllProc is a wrapper around a syscall.Proc with more conventional error
@@ -2217,4 +2296,22 @@ func tryLoadWinFSP() error {
 		tryLoadErr = initWinFSP()
 	})
 	return tryLoadErr
+}
+
+// LoadWinFSPWithDLL will try to resolve the symbols with
+// the DLL provided, the work is done once and the error
+// will be persistent.
+//
+// If the default WinFSP loading process does not work
+// for you, then explicitly specifying one is the only
+// choice. But you have to take your own risk now.
+func LoadWinFSPWithDLL(dll *syscall.DLL) error {
+	winFSPDLL = dll
+	return tryLoadWinFSP()
+}
+
+// LoadWinFSP will load the WinFSP DLL and resolve its
+// symbolds immediately.
+func LoadWinFSP() error {
+	return LoadWinFSPWithDLL(nil)
 }
