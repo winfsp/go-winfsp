@@ -22,12 +22,12 @@ type memObject interface {
 
 type memFile struct {
 	dataMtx sync.Mutex
-	// Must acquire file.dataMtx to modify.
-	file []byte
+	// Must acquire data.dataMtx to modify.
+	data []byte
 }
 
 func (m *memFile) size() int64 {
-	return int64(len(m.file))
+	return int64(len(m.data))
 }
 
 var _ memObject = (*memFile)(nil)
@@ -154,8 +154,9 @@ func (m *memOpenFile) ReadAt(p []byte, off int64) (n int, err error) {
 	defer m.item.touch()
 	m.file.dataMtx.Lock()
 	defer m.file.dataMtx.Unlock()
-	numRead := copy(p, m.file.file[off:])
-	if numRead == 0 && len(m.file.file) == 0 {
+	sliceOff := min(off, int64(len(m.file.data)))
+	numRead := copy(p, m.file.data[sliceOff:])
+	if numRead == 0 && len(p) > 0 {
 		return 0, io.EOF
 	}
 	return numRead, nil
@@ -172,17 +173,17 @@ func (m *memOpenFile) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekStart:
 		m.offset = 0
 	case io.SeekEnd:
-		m.offset = int64(len(m.file.file))
+		m.offset = int64(len(m.file.data))
 	}
 	m.offset += offset
 	return m.offset, nil
 }
 
 func (file *memFile) reserveLocked(size int64) {
-	lesser := size - int64(len(file.file))
+	lesser := size - int64(len(file.data))
 	if lesser > 0 {
 		filling := make([]byte, int(lesser))
-		file.file = append(file.file, filling...)
+		file.data = append(file.data, filling...)
 	}
 }
 
@@ -191,12 +192,13 @@ func (m *memOpenFile) Truncate(size int64) error {
 	m.file.dataMtx.Lock()
 	defer m.file.dataMtx.Unlock()
 	m.file.reserveLocked(size)
-	m.file.file = m.file.file[:size]
+	m.file.data = m.file.data[:size]
 	return nil
 }
 
 func (m *memOpenFile) writeAtLocked(p []byte, off int64) (n int, err error) {
-	numWritten := copy(m.file.file[off:], p)
+	sliceOff := min(off, int64(len(m.file.data)))
+	numWritten := copy(m.file.data[sliceOff:], p)
 	return numWritten, nil
 }
 
@@ -232,7 +234,7 @@ var _ gofs.File = (*memOpenFile)(nil)
 
 func (m *memOpenFile) Append(buf []byte) (int, error) {
 	return m.writeWithDataLock(func() (int, error) {
-		m.file.file = append(m.file.file, buf...)
+		m.file.data = append(m.file.data, buf...)
 		return len(buf), nil
 	})
 }
@@ -249,8 +251,8 @@ func (m *memOpenFile) Shrink(newSize int64) error {
 	defer m.item.touch()
 	m.file.dataMtx.Lock()
 	defer m.file.dataMtx.Unlock()
-	if newSize < int64(len(m.file.file)) {
-		m.file.file = m.file.file[:newSize]
+	if newSize < int64(len(m.file.data)) {
+		m.file.data = m.file.data[:newSize]
 	}
 	return nil
 }
@@ -301,8 +303,9 @@ func (m *memOpenDir) Readdir(count int) ([]os.FileInfo, error) {
 		return result, nil
 	} else {
 		result = make([]os.FileInfo, count)
-		copied := copy(result, m.snapshot[m.off:])
-		if copied == 0 && len(m.snapshot[m.off:]) == 0 {
+		sliceOff := min(m.off, int64(len(m.snapshot)))
+		copied := copy(result, m.snapshot[sliceOff:])
+		if copied == 0 {
 			return nil, io.EOF
 		}
 		return result[:copied], nil
