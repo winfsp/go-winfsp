@@ -16,6 +16,8 @@ import (
 
 	"github.com/pkg/errors"
 	"golang.org/x/sys/windows"
+
+	"github.com/winfsp/go-winfsp/log"
 )
 
 // FileSystemRef is the reference for the file system,
@@ -24,6 +26,7 @@ import (
 type FileSystemRef struct {
 	fileSystemOps         *FSP_FILE_SYSTEM_INTERFACE
 	fileSystem            *FSP_FILE_SYSTEM
+	log                   log.Log
 	base                  BehaviourBase
 	getVolumeInfo         BehaviourGetVolumeInfo
 	setVolumeLabel        BehaviourSetVolumeLabel
@@ -153,24 +156,56 @@ type BehaviourBase interface {
 }
 
 func delegateOpen(
-	fileSystem, fileName uintptr,
+	fileSystem, fileNameAddr uintptr,
 	createOptions, grantedAccess uint32,
-	file *uintptr, fileInfoAddr uintptr,
-) windows.NTStatus {
+	fileAddr *uintptr, fileInfoAddr uintptr,
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	result, err := ref.base.Open(
-		ref, utf16PtrToString(fileName),
+	if fileAddr == nil {
+		return ntStatusNoRef
+	}
+
+	var (
+		result uintptr
+		err    error
+	)
+	fileName := utf16PtrToString(fileNameAddr)
+	fileInfo := (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateOpen"
+		cookie := ref.log.Call(name, log.M{
+			"fileName":      fileName,
+			"createOptions": DebugCreateOptions(createOptions),
+			"grantedAccess": DebugGrantedAccess(grantedAccess),
+		})
+		defer func() {
+			var fileInfo1 *FSP_FSCTL_FILE_INFO
+			if fileInfo != nil {
+				clone := *fileInfo
+				fileInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"error":    err,
+				"status":   status,
+				"file":     result,
+				"fileInfo": DebugFileInfo{fileInfo1},
+			})
+		}()
+	}
+
+	result, err = ref.base.Open(
+		ref, fileName,
 		createOptions, grantedAccess,
-		(*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(fileInfoAddr)),
+		fileInfo,
 	)
 	if err != nil {
 		return convertNTStatus(err)
 	}
-	*file = result
+	*fileAddr = result
 	return windows.STATUS_SUCCESS
 }
 
@@ -191,6 +226,15 @@ func delegateClose(fileSystem, file uintptr) {
 	if ref == nil {
 		return
 	}
+
+	if l := ref.log; l.Enabled(log.TopicCall) {
+		const name = "delegateClose"
+		cookie := l.Call(name, log.M{
+			"file": file,
+		})
+		defer l.Return(name, cookie, log.M{})
+	}
+
 	ref.base.Close(ref, file)
 }
 
@@ -210,15 +254,35 @@ type BehaviourGetVolumeInfo interface {
 
 func delegateGetVolumeInfo(
 	fileSystem, volumeInfoAddr uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.getVolumeInfo.GetVolumeInfo(
-		ref, (*FSP_FSCTL_VOLUME_INFO)(
-			unsafe.Pointer(volumeInfoAddr)),
-	))
+	var err error
+	volumeInfo := (*FSP_FSCTL_VOLUME_INFO)(unsafe.Pointer(volumeInfoAddr))
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateGetVolumeInfo"
+		cookie := ref.log.Call(name, log.M{})
+		defer func() {
+			var volumeInfo1 *FSP_FSCTL_VOLUME_INFO
+			if volumeInfo != nil {
+				clone := *volumeInfo
+				volumeInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"volumeInfo": DebugVolumeInfo{volumeInfo1},
+				"err":        err,
+				"status":     status,
+			})
+		}()
+	}
+
+	err = ref.getVolumeInfo.GetVolumeInfo(
+		ref, volumeInfo,
+	)
+	return convertNTStatus(err)
 }
 
 var go_delegateGetVolumeInfo = syscall.NewCallbackCDecl(func(
@@ -239,16 +303,39 @@ type BehaviourSetVolumeLabel interface {
 
 func delegateSetVolumeLabel(
 	fileSystem, labelAddr, volumeInfoAddr uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.setVolumeLabel.SetVolumeLabel(
-		ref, utf16PtrToString(labelAddr),
-		(*FSP_FSCTL_VOLUME_INFO)(
-			unsafe.Pointer(volumeInfoAddr)),
-	))
+
+	var err error
+	label := utf16PtrToString(labelAddr)
+	volumeInfo := (*FSP_FSCTL_VOLUME_INFO)(unsafe.Pointer(volumeInfoAddr))
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateSetVolumeLabel"
+		cookie := ref.log.Call(name, log.M{
+			"label": label,
+		})
+		defer func() {
+			var volumeInfo1 *FSP_FSCTL_VOLUME_INFO
+			if volumeInfo != nil {
+				clone := *volumeInfo
+				volumeInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"err":        err,
+				"volumeInfo": DebugVolumeInfo{volumeInfo1},
+				"status":     status,
+			})
+		}()
+	}
+
+	err = ref.setVolumeLabel.SetVolumeLabel(
+		ref, label, volumeInfo,
+	)
+	return convertNTStatus(err)
 }
 
 var go_delegateSetVolumeLabel = syscall.NewCallbackCDecl(func(
@@ -284,9 +371,9 @@ type BehaviourGetSecurityByName interface {
 }
 
 func delegateGetSecurityByName(
-	fileSystem, fileName, attributesAddr uintptr,
+	fileSystem, fileNameAddr, attributesAddr uintptr,
 	securityDescAddr, securityDescSizeAddr uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	flags := GetExistenceOnly
 	attributes := (*uint32)(unsafe.Pointer(attributesAddr))
 	if attributes != nil {
@@ -304,8 +391,33 @@ func delegateGetSecurityByName(
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	attr, sd, err := ref.getSecurityByName.GetSecurityByName(
-		ref, utf16PtrToString(fileName), flags)
+
+	var (
+		attr uint32
+		sd   *windows.SECURITY_DESCRIPTOR
+		err  error
+	)
+	fileName := utf16PtrToString(fileNameAddr)
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateGetSecurityByName"
+		cookie := ref.log.Call(name, log.M{
+			"fileName":   fileName,
+			"flags":      flags,
+			"bufferSize": bufferSize,
+		})
+		defer func() {
+			ref.log.Return(name, cookie, log.M{
+				"attr":   DebugFileAttributes(attr),
+				"sd":     sd,
+				"err":    err,
+				"status": status,
+			})
+		}()
+	}
+
+	attr, sd, err = ref.getSecurityByName.GetSecurityByName(
+		ref, fileName, flags)
 	if err != nil {
 		return convertNTStatus(err)
 	}
@@ -345,22 +457,52 @@ type BehaviourCreate interface {
 }
 
 func delegateCreate(
-	fileSystem, fileName uintptr,
+	fileSystem, fileNameAddr uintptr,
 	createOptions, grantedAccess, fileAttributes uint32,
 	securityDescriptor uintptr, allocationSize uint64,
 	file *uintptr, fileInfoAddr uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	result, err := ref.create.Create(
-		ref, utf16PtrToString(fileName),
+
+	var (
+		result uintptr
+		err    error
+	)
+	fileName := utf16PtrToString(fileNameAddr)
+	sd := (*windows.SECURITY_DESCRIPTOR)(unsafe.Pointer(securityDescriptor))
+	fileInfo := (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateCreate"
+		cookie := ref.log.Call(name, log.M{
+			"fileName":       fileName,
+			"createOptions":  DebugCreateOptions(createOptions),
+			"grantedAccess":  DebugGrantedAccess(grantedAccess),
+			"fileAttributes": DebugFileAttributes(fileAttributes),
+			"sd":             sd,
+		})
+		defer func() {
+			var fileInfo1 *FSP_FSCTL_FILE_INFO
+			if fileInfo != nil {
+				clone := *fileInfo
+				fileInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"error":    err,
+				"status":   status,
+				"file":     result,
+				"fileInfo": DebugFileInfo{fileInfo1},
+			})
+		}()
+	}
+
+	result, err = ref.create.Create(
+		ref, fileName,
 		createOptions, grantedAccess, fileAttributes,
-		(*windows.SECURITY_DESCRIPTOR)(
-			unsafe.Pointer(securityDescriptor)),
-		allocationSize, (*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(fileInfoAddr)),
+		sd, allocationSize, fileInfo,
 	)
 	if err != nil {
 		return convertNTStatus(err)
@@ -397,16 +539,42 @@ func delegateOverwrite(
 	fileSystem, file uintptr,
 	attributes uint32, replaceAttributes uint8,
 	allocationSize uint64, fileInfoAddr uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.overwrite.Overwrite(
+
+	var err error
+	fileInfo := (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateOverwrite"
+		cookie := ref.log.Call(name, log.M{
+			"file":              file,
+			"attributes":        DebugFileAttributes(attributes),
+			"replaceAttributes": replaceAttributes,
+			"allocationSize":    allocationSize,
+		})
+		defer func() {
+			var fileInfo1 *FSP_FSCTL_FILE_INFO
+			if fileInfo != nil {
+				clone := *fileInfo
+				fileInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"error":    err,
+				"status":   status,
+				"fileInfo": DebugFileInfo{fileInfo1},
+			})
+		}()
+	}
+
+	err = ref.overwrite.Overwrite(
 		ref, file, attributes, replaceAttributes != 0,
-		allocationSize, (*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(fileInfoAddr)),
-	))
+		allocationSize, fileInfo,
+	)
+	return convertNTStatus(err)
 }
 
 var go_delegateOverwrite = syscall.NewCallbackCDecl(func(
@@ -430,16 +598,30 @@ type BehaviourCleanup interface {
 }
 
 func delegateCleanup(
-	fileSystem, fileContext, filename uintptr,
+	fileSystem, file, fileNameAddr uintptr,
 	cleanupFlags uint32,
 ) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return
 	}
+
+	fileName := utf16PtrToString(fileNameAddr)
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateCleanup"
+		cookie := ref.log.Call(name, log.M{
+			"file":         file,
+			"fileName":     fileName,
+			"cleanupFlags": cleanupFlags,
+		})
+		defer func() {
+			ref.log.Return(name, cookie, log.M{})
+		}()
+	}
+
 	ref.cleanup.Cleanup(
-		ref, fileContext, utf16PtrToString(filename),
-		cleanupFlags,
+		ref, file, fileName, cleanupFlags,
 	)
 }
 
@@ -463,17 +645,41 @@ type BehaviourRead interface {
 }
 
 func delegateRead(
-	fileSystem, fileContext, buffer uintptr,
+	fileSystem, file, buffer uintptr,
 	offset uint64, length uint32, bytesRead *uint32,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	*bytesRead = 0
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	n, err := ref.read.Read(ref, fileContext,
+	var (
+		n       int
+		origErr error
+		err     error
+	)
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateRead"
+		cookie := ref.log.Call(name, log.M{
+			"file":   file,
+			"offset": offset,
+			"length": length,
+		})
+		defer func() {
+			ref.log.Return(name, cookie, log.M{
+				"n":         n,
+				"bytesRead": *bytesRead,
+				"error":     origErr,
+				"status":    status,
+			})
+		}()
+	}
+
+	n, err = ref.read.Read(ref, file,
 		enforceBytePtr(buffer, int(length)), offset)
 	*bytesRead = uint32(n)
+	origErr = err
 	// XXX: this is required otherwise windows kernel render
 	// it as nothing read from the file instead.
 	if n > 0 && err == io.EOF {
@@ -503,21 +709,54 @@ type BehaviourWrite interface {
 }
 
 func delegateWrite(
-	fileSystem, fileContext, buffer uintptr,
+	fileSystem, file, buffer uintptr,
 	offset uint64, length uint32,
 	writeToEndOfFile, constrainedIo uint8,
 	bytesWritten *uint32, fileInfoAddr uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	*bytesWritten = 0
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	n, err := ref.write.Write(ref, fileContext,
+
+	var (
+		n   int
+		err error
+	)
+
+	fileInfo := (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateWrite"
+		cookie := ref.log.Call(name, log.M{
+			"file":             file,
+			"length":           length,
+			"offset":           offset,
+			"writeToEndOfFile": writeToEndOfFile,
+			"constrainedIo":    constrainedIo,
+		})
+		defer func() {
+			var fileInfo1 *FSP_FSCTL_FILE_INFO
+			if fileInfo != nil {
+				clone := *fileInfo
+				fileInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"n":            n,
+				"bytesWritten": *bytesWritten,
+				"error":        err,
+				"status":       status,
+				"fileInfo":     DebugFileInfo{fileInfo1},
+			})
+		}()
+	}
+
+	n, err = ref.write.Write(
+		ref, file,
 		enforceBytePtr(buffer, int(length)), offset,
 		writeToEndOfFile != 0, constrainedIo != 0,
-		(*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(fileInfoAddr)),
+		fileInfo,
 	)
 	*bytesWritten = uint32(n)
 	return convertNTStatus(err)
@@ -549,16 +788,37 @@ type BehaviourFlush interface {
 }
 
 func delegateFlush(
-	fileSystem, fileContext, infoAddr uintptr,
-) windows.NTStatus {
+	fileSystem, file, fileInfoAddr uintptr,
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.flush.Flush(
-		ref, fileContext, (*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(infoAddr)),
-	))
+	var err error
+
+	fileInfo := (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateFlush"
+		cookie := ref.log.Call(name, log.M{
+			"file": file,
+		})
+		defer func() {
+			var fileInfo1 *FSP_FSCTL_FILE_INFO
+			if fileInfo != nil {
+				clone := *fileInfo
+				fileInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"error":    err,
+				"status":   status,
+				"fileInfo": DebugFileInfo{fileInfo1},
+			})
+		}()
+	}
+
+	err = ref.flush.Flush(ref, file, fileInfo)
+	return convertNTStatus(err)
 }
 
 var go_delegateFlush = syscall.NewCallbackCDecl(func(
@@ -578,16 +838,37 @@ type BehaviourGetFileInfo interface {
 }
 
 func delegateGetFileInfo(
-	fileSystem, fileContext, infoAddr uintptr,
-) windows.NTStatus {
+	fileSystem, file, fileInfoAddr uintptr,
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.getFileInfo.GetFileInfo(
-		ref, fileContext, (*FSP_FSCTL_FILE_INFO)(
-			unsafe.Pointer(infoAddr)),
-	))
+
+	var err error
+	fileInfo := (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateGetFileInfo"
+		cookie := ref.log.Call(name, log.M{
+			"file": file,
+		})
+		defer func() {
+			var fileInfo1 *FSP_FSCTL_FILE_INFO
+			if fileInfo != nil {
+				clone := *fileInfo
+				fileInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"error":    err,
+				"status":   status,
+				"fileInfo": DebugFileInfo{fileInfo1},
+			})
+		}()
+	}
+
+	err = ref.getFileInfo.GetFileInfo(ref, file, fileInfo)
+	return convertNTStatus(err)
 }
 
 var go_delegateGetFileInfo = syscall.NewCallbackCDecl(func(
@@ -621,11 +902,11 @@ type BehaviourSetBasicInfo interface {
 }
 
 func delegateSetBasicInfo(
-	fileSystem, fileContext uintptr,
+	fileSystem, file uintptr,
 	attributes uint32,
 	creationTime, lastAccessTime, lastWriteTime, changeTime uint64,
 	fileInfoAddr uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
@@ -646,11 +927,40 @@ func delegateSetBasicInfo(
 	if changeTime != 0 {
 		flags |= SetBasicInfoChangeTime
 	}
-	return convertNTStatus(ref.setBasicInfo.SetBasicInfo(
-		ref, fileContext, flags, attributes,
+	fileInfo := (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))
+	var err error
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateSetBasicInfo"
+		cookie := ref.log.Call(name, log.M{
+			"file":           file,
+			"flags":          flags,
+			"attributes":     DebugFileAttributes(attributes),
+			"creationTime":   DebugFiletime(creationTime),
+			"lastAccessTime": DebugFiletime(lastAccessTime),
+			"lastWriteTime":  DebugFiletime(lastWriteTime),
+			"changeTime":     DebugFiletime(changeTime),
+		})
+		defer func() {
+			var fileInfo1 *FSP_FSCTL_FILE_INFO
+			if fileInfo != nil {
+				clone := *fileInfo
+				fileInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"error":    err,
+				"status":   status,
+				"fileInfo": DebugFileInfo{fileInfo1},
+			})
+		}()
+	}
+
+	err = ref.setBasicInfo.SetBasicInfo(
+		ref, file, flags, attributes,
 		creationTime, lastAccessTime, lastWriteTime, changeTime,
-		(*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr)),
-	))
+		fileInfo,
+	)
+	return convertNTStatus(err)
 }
 
 var go_delegateSetBasicInfo = syscall.NewCallbackCDecl(func(
@@ -676,18 +986,44 @@ type BehaviourSetFileSize interface {
 }
 
 func delegateSetFileSize(
-	fileSystem, fileContext uintptr,
+	fileSystem, file uintptr,
 	newSize uint64, setAllocationSize uint8,
 	fileInfoAddr uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.setFileSize.SetFileSize(
-		ref, fileContext, newSize, setAllocationSize != 0,
-		(*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr)),
-	))
+
+	var err error
+	fileInfo := (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateSetFileSize"
+		cookie := ref.log.Call(name, log.M{
+			"file":              file,
+			"newSize":           newSize,
+			"setAllocationSize": setAllocationSize,
+		})
+		defer func() {
+			var fileInfo1 *FSP_FSCTL_FILE_INFO
+			if fileInfo != nil {
+				clone := *fileInfo
+				fileInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"error":    err,
+				"status":   status,
+				"fileInfo": DebugFileInfo{fileInfo1},
+			})
+		}()
+	}
+
+	err = ref.setFileSize.SetFileSize(
+		ref, file, newSize, setAllocationSize != 0,
+		fileInfo,
+	)
+	return convertNTStatus(err)
 }
 
 var go_delegateSetFileSize = syscall.NewCallbackCDecl(func(
@@ -710,15 +1046,32 @@ type BehaviourCanDelete interface {
 }
 
 func delegateCanDelete(
-	fileSystem, fileContext, filename uintptr,
-) windows.NTStatus {
+	fileSystem, file, fileNameAddr uintptr,
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.canDelete.CanDelete(
-		ref, fileContext, utf16PtrToString(filename),
-	))
+
+	var err error
+	fileName := utf16PtrToString(fileNameAddr)
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateCanDelete"
+		cookie := ref.log.Call(name, log.M{
+			"file":     file,
+			"fileName": fileName,
+		})
+		defer func() {
+			ref.log.Return(name, cookie, log.M{
+				"error":  err,
+				"status": status,
+			})
+		}()
+	}
+
+	err = ref.canDelete.CanDelete(ref, file, fileName)
+	return convertNTStatus(err)
 }
 
 var go_delegateCanDelete = syscall.NewCallbackCDecl(func(
@@ -738,18 +1091,41 @@ type BehaviourRename interface {
 }
 
 func delegateRename(
-	fileSystem, fileContext uintptr,
-	source, target uintptr, replaceIfExists uint8,
-) windows.NTStatus {
+	fileSystem, file uintptr,
+	sourceAddr, targetAddr uintptr,
+	replaceIfExists uint8,
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.rename.Rename(
-		ref, fileContext,
-		utf16PtrToString(source), utf16PtrToString(target),
+
+	var err error
+	source := utf16PtrToString(sourceAddr)
+	target := utf16PtrToString(targetAddr)
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateRename"
+		cookie := ref.log.Call(name, log.M{
+			"file":            file,
+			"source":          source,
+			"target":          target,
+			"replaceIfExists": replaceIfExists,
+		})
+		defer func() {
+			ref.log.Return(name, cookie, log.M{
+				"error":  err,
+				"status": status,
+			})
+		}()
+	}
+
+	err = ref.rename.Rename(
+		ref, file,
+		source, target,
 		replaceIfExists != 0,
-	))
+	)
+	return convertNTStatus(err)
 }
 
 var go_delegateRename = syscall.NewCallbackCDecl(func(
@@ -770,9 +1146,9 @@ type BehaviourGetSecurity interface {
 }
 
 func delegateGetSecurity(
-	fileSystem, fileContext uintptr,
+	fileSystem, file uintptr,
 	securityDescAddr, securityDescSizeAddr uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	size := (*uintptr)(unsafe.Pointer(securityDescSizeAddr))
 	var bufferSize int
 	if size != nil {
@@ -783,7 +1159,26 @@ func delegateGetSecurity(
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	sd, err := ref.getSecurity.GetSecurity(ref, fileContext)
+	var (
+		sd  *windows.SECURITY_DESCRIPTOR
+		err error
+	)
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateGetSecurity"
+		cookie := ref.log.Call(name, log.M{
+			"file": file,
+		})
+		defer func() {
+			ref.log.Return(name, cookie, log.M{
+				"sd":     sd,
+				"error":  err,
+				"status": status,
+			})
+		}()
+	}
+
+	sd, err = ref.getSecurity.GetSecurity(ref, file)
 	if err != nil {
 		return convertNTStatus(err)
 	}
@@ -822,17 +1217,38 @@ type BehaviourSetSecurity interface {
 }
 
 func delegateSetSecurity(
-	fileSystem, fileContext uintptr,
+	fileSystem, file uintptr,
 	info windows.SECURITY_INFORMATION, securityDescSizeAddr uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.setSecurity.SetSecurity(
-		ref, fileContext, info,
-		(*windows.SECURITY_DESCRIPTOR)(unsafe.Pointer(
-			securityDescSizeAddr))))
+
+	sd := (*windows.SECURITY_DESCRIPTOR)(unsafe.Pointer(securityDescSizeAddr))
+	var err error
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateSetSecurity"
+		var sd1 *windows.SECURITY_DESCRIPTOR
+		if sd != nil {
+			clone := *sd
+			sd1 = &clone
+		}
+		cookie := ref.log.Call(name, log.M{
+			"file": file,
+			"sd":   sd1,
+		})
+		defer func() {
+			ref.log.Return(name, cookie, log.M{
+				"error":  err,
+				"status": status,
+			})
+		}()
+	}
+
+	err = ref.setSecurity.SetSecurity(ref, file, info, sd)
+	return convertNTStatus(err)
 }
 
 var go_delegateSetSecurity = syscall.NewCallbackCDecl(func(
@@ -976,16 +1392,36 @@ type BehaviourReadDirectoryRaw interface {
 }
 
 func delegateReadDirectory(
-	fileSystem, fileContext uintptr,
+	fileSystem, file uintptr,
 	pattern, marker *uint16,
 	buf uintptr, length uint32, numRead *uint32,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	n, err := ref.readDirRaw.ReadDirectoryRaw(
-		ref, fileContext, pattern, marker,
+	var (
+		n   int
+		err error
+	)
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateReadDirectory"
+		// TODO: log other parameters?
+		cookie := ref.log.Call(name, log.M{
+			"file":   file,
+			"length": length,
+		})
+		defer func() {
+			ref.log.Return(name, cookie, log.M{
+				"error":   err,
+				"status":  status,
+				"n":       n,
+				"numRead": *numRead,
+			})
+		}()
+	}
+	n, err = ref.readDirRaw.ReadDirectoryRaw(
+		ref, file, pattern, marker,
 		enforceBytePtr(buf, int(length)))
 	*numRead = uint32(n)
 	return convertNTStatus(err)
@@ -1093,16 +1529,40 @@ type BehaviourGetDirInfoByName interface {
 
 func delegateGetDirInfoByName(
 	fileSystem, parentDirFile uintptr,
-	fileName, dirInfoAddr uintptr,
-) windows.NTStatus {
+	fileNameAddr, dirInfoAddr uintptr,
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.getDirInfoByName.GetDirInfoByName(
-		ref, parentDirFile, utf16PtrToString(fileName),
-		(*FSP_FSCTL_DIR_INFO)(unsafe.Pointer(dirInfoAddr)),
-	))
+	var err error
+	dirInfo := (*FSP_FSCTL_DIR_INFO)(unsafe.Pointer(dirInfoAddr))
+	fileName := utf16PtrToString(fileNameAddr)
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateGetDirInfoByName"
+		cookie := ref.log.Call(name, log.M{
+			"parentDirFile": parentDirFile,
+			"fileName":      fileName,
+		})
+		defer func() {
+			var dirInfo1 *FSP_FSCTL_DIR_INFO
+			if dirInfo != nil {
+				clone := *dirInfo
+				dirInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"error":   err,
+				"status":  status,
+				"dirInfo": dirInfo1,
+			})
+		}()
+	}
+
+	err = ref.getDirInfoByName.GetDirInfoByName(
+		ref, parentDirFile, fileName, dirInfo,
+	)
+	return convertNTStatus(err)
 }
 
 var go_delegateGetDirInfoByName = syscall.NewCallbackCDecl(func(
@@ -1124,25 +1584,49 @@ type BehaviourDeviceIoControl interface {
 }
 
 func delegateDeviceIoControl(
-	fileSystem, fileContext uintptr, controlCode uint32,
+	fileSystem, file uintptr, controlCode uint32,
 	inputBuffer uintptr, inputBufferLength uint32,
 	outputBuffer uintptr, outputBufferLength uint32,
 	bytesWritten *uint32,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	*bytesWritten = 0
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
+	var (
+		result []byte
+		err    error
+		copied int
+	)
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateDeviceIoControl"
+		cookie := ref.log.Call(name, log.M{
+			"file":               file,
+			"controlCode":        controlCode,
+			"inputBufferLength":  inputBufferLength,
+			"outputBufferLength": outputBufferLength,
+		})
+		defer func() {
+			ref.log.Return(name, cookie, log.M{
+				"error":        err,
+				"status":       status,
+				"copied":       copied,
+				"bytesWritten": *bytesWritten,
+			})
+		}()
+	}
+
 	input := enforceBytePtr(inputBuffer, int(inputBufferLength))
-	result, err := ref.deviceIoControl.DeviceIoControl(
-		ref, fileContext, controlCode, input,
+	result, err = ref.deviceIoControl.DeviceIoControl(
+		ref, file, controlCode, input,
 	)
 	if err != nil {
 		return convertNTStatus(err)
 	}
 	output := enforceBytePtr(outputBuffer, int(outputBufferLength))
-	copied := copy(output, result)
+	copied = copy(output, result)
 	*bytesWritten = uint32(copied)
 	if copied < len(output) {
 		return windows.STATUS_BUFFER_OVERFLOW
@@ -1187,38 +1671,74 @@ type BehaviourCreateEx interface {
 }
 
 func delegateCreateEx(
-	fileSystem, fileName uintptr,
+	fileSystem, fileNameAddr uintptr,
 	createOptions, grantedAccess, fileAttributes uint32,
 	securityDescriptor uintptr, allocationSize uint64,
 	extraBuffer uintptr, extraLength uint32, isReparse uint8,
 	file *uintptr, fileInfoAddr uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	result, err := func() (uintptr, error) {
+
+	fileName := utf16PtrToString(fileNameAddr)
+	sd := (*windows.SECURITY_DESCRIPTOR)(unsafe.Pointer(securityDescriptor))
+	fileInfo := (*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr))
+	var (
+		result uintptr
+		err    error
+	)
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateCreateEx"
+		// TODO: extraBuffer?
+		var sd1 *windows.SECURITY_DESCRIPTOR
+		if sd != nil {
+			clone := *sd
+			sd1 = &clone
+		}
+		cookie := ref.log.Call(name, log.M{
+			"fileName":       fileName,
+			"sd":             sd1,
+			"createOptions":  DebugCreateOptions(createOptions),
+			"grantedAccess":  DebugGrantedAccess(grantedAccess),
+			"fileAttributes": DebugFileAttributes(fileAttributes),
+			"allocationSize": allocationSize,
+			"extraLength":    extraLength,
+			"isReparse":      isReparse,
+		})
+		defer func() {
+			var fileInfo1 *FSP_FSCTL_FILE_INFO
+			if fileInfo != nil {
+				clone := *fileInfo
+				fileInfo1 = &clone
+			}
+			ref.log.Return(name, cookie, log.M{
+				"error":    err,
+				"status":   status,
+				"file":     result,
+				"fileInfo": DebugFileInfo{fileInfo1},
+			})
+		}()
+	}
+
+	result, err = func() (uintptr, error) {
 		if isReparse != 0 {
 			return ref.createEx.CreateExWithReparsePointData(
-				ref, utf16PtrToString(fileName),
+				ref, fileName,
 				createOptions, grantedAccess, fileAttributes,
-				(*windows.SECURITY_DESCRIPTOR)(
-					unsafe.Pointer(securityDescriptor)),
-				(*REPARSE_DATA_BUFFER_GENERIC)(
+				sd, (*REPARSE_DATA_BUFFER_GENERIC)(
 					unsafe.Pointer(extraBuffer)),
-				allocationSize, (*FSP_FSCTL_FILE_INFO)(
-					unsafe.Pointer(fileInfoAddr)),
+				allocationSize, fileInfo,
 			)
 		} else {
 			return ref.createEx.CreateExWithExtendedAttribute(
-				ref, utf16PtrToString(fileName),
+				ref, fileName,
 				createOptions, grantedAccess, fileAttributes,
-				(*windows.SECURITY_DESCRIPTOR)(
-					unsafe.Pointer(securityDescriptor)),
-				(*FILE_FULL_EA_INFORMATION)(
+				sd, (*FILE_FULL_EA_INFORMATION)(
 					unsafe.Pointer(extraBuffer)),
-				allocationSize, (*FSP_FSCTL_FILE_INFO)(
-					unsafe.Pointer(fileInfoAddr)),
+				allocationSize, fileInfo,
 			)
 		}
 	}()
@@ -1267,17 +1787,37 @@ type BehaviourDeleteReparsePoint interface {
 }
 
 func delegateDeleteReparsePoint(
-	fileSystem, fileContext, fileName uintptr,
+	fileSystem, file, fileNameAddr uintptr,
 	buffer, size uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.deleteReparsePoint.DeleteReparsePoint(
-		ref, fileContext, utf16PtrToString(fileName),
+
+	fileName := utf16PtrToString(fileNameAddr)
+	var err error
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateDeleteReparsePoint"
+		// TODO: buffer, size?
+		cookie := ref.log.Call(name, log.M{
+			"file":     file,
+			"fileName": fileName,
+		})
+		defer func() {
+			ref.log.Return(name, cookie, log.M{
+				"error":  err,
+				"status": status,
+			})
+		}()
+	}
+
+	err = ref.deleteReparsePoint.DeleteReparsePoint(
+		ref, file, fileName,
 		enforceBytePtr(buffer, int(size)),
-	))
+	)
+	return convertNTStatus(err)
 }
 
 var go_delegateDeleteReparsePoint = syscall.NewCallbackCDecl(func(
@@ -1299,16 +1839,40 @@ type BehaviourGetReparsePoint interface {
 }
 
 func delegateGetReparsePoint(
-	fileSystem, fileContext, fileName uintptr,
+	fileSystem, file, fileNameAddr uintptr,
 	buffer uintptr, size *uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
 	bufferSize := int(*size)
-	usedBytes, err := ref.getReparsePoint.GetReparsePoint(
-		ref, fileContext, utf16PtrToString(fileName),
+	var (
+		usedBytes int
+		err       error
+	)
+	fileName := utf16PtrToString(fileNameAddr)
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateGetReparsePoint"
+		cookie := ref.log.Call(name, log.M{
+			"file":       file,
+			"fileName":   fileName,
+			"bufferSize": bufferSize,
+		})
+		defer func() {
+			// TODO: buffer?
+			ref.log.Return(name, cookie, log.M{
+				"error":     err,
+				"status":    status,
+				"usedBytes": usedBytes,
+				"size":      *size,
+			})
+		}()
+	}
+
+	usedBytes, err = ref.getReparsePoint.GetReparsePoint(
+		ref, file, fileName,
 		enforceBytePtr(buffer, bufferSize),
 	)
 	if err != nil {
@@ -1337,9 +1901,9 @@ type BehaviourGetReparsePointByName interface {
 }
 
 func delegateGetReparsePointByName(
-	fileSystem, context, fileName uintptr,
+	fileSystem, context, fileNameAddr uintptr,
 	isDirectory uint8, buffer uintptr, size *uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
@@ -1350,8 +1914,31 @@ func delegateGetReparsePointByName(
 	} else {
 		bufferSize = 0
 	}
-	usedBytes, err := ref.getReparsePointByName.GetReparsePointByName(
-		ref, utf16PtrToString(fileName), isDirectory != 0,
+	var (
+		usedBytes int
+		err       error
+	)
+	fileName := utf16PtrToString(fileNameAddr)
+
+	if ref.log.Enabled(log.TopicCall) {
+		name := "delegateGetReparsePointByName"
+		cookie := ref.log.Call(name, log.M{
+			"fileName":    fileName,
+			"isDirectory": isDirectory,
+			"bufferSize":  bufferSize,
+		})
+		defer func() {
+			// TODO: size?
+			ref.log.Return(name, cookie, log.M{
+				"error":     err,
+				"status":    status,
+				"usedBytes": usedBytes,
+			})
+		}()
+	}
+
+	usedBytes, err = ref.getReparsePointByName.GetReparsePointByName(
+		ref, fileName, isDirectory != 0,
 		enforceBytePtr(buffer, bufferSize),
 	)
 	if err != nil {
@@ -1417,17 +2004,36 @@ type BehaviourSetReparsePoint interface {
 }
 
 func delegateSetReparsePoint(
-	fileSystem, fileContext, fileName uintptr,
+	fileSystem, file, fileNameAddr uintptr,
 	buffer, size uintptr,
-) windows.NTStatus {
+) (status windows.NTStatus) {
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
 	}
-	return convertNTStatus(ref.setReparsePoint.SetReparsePoint(
-		ref, fileContext, utf16PtrToString(fileName),
+	fileName := utf16PtrToString(fileNameAddr)
+	var err error
+
+	if ref.log.Enabled(log.TopicCall) {
+		const name = "delegateSetReparsePoint"
+		// TODO: buffer? size?
+		cookie := ref.log.Call(name, log.M{
+			"file":     file,
+			"fileName": fileName,
+		})
+		defer func() {
+			ref.log.Return(name, cookie, log.M{
+				"error":  err,
+				"status": status,
+			})
+		}()
+	}
+
+	err = ref.setReparsePoint.SetReparsePoint(
+		ref, file, fileName,
 		enforceBytePtr(buffer, int(size)),
-	))
+	)
+	return convertNTStatus(err)
 }
 
 var go_delegateSetReparsePoint = syscall.NewCallbackCDecl(func(
@@ -1440,8 +2046,11 @@ var go_delegateSetReparsePoint = syscall.NewCallbackCDecl(func(
 	))
 })
 
-// PosixMapSecurityDescriptorToPermissions maps a Windows security descriptor to POSIX permissions.
-func PosixMapSecurityDescriptorToPermissions(securityDescriptor *windows.SECURITY_DESCRIPTOR) (uid, gid, mode uint32, err error) {
+// PosixMapSecurityDescriptorToPermissions maps a Windows
+// security descriptor to POSIX permissions.
+func PosixMapSecurityDescriptorToPermissions(
+	securityDescriptor *windows.SECURITY_DESCRIPTOR,
+) (uid, gid, mode uint32, err error) {
 	err = posixMapSecurityDescriptorToPermissions.CallStatus(
 		uintptr(unsafe.Pointer(securityDescriptor)),
 		uintptr(unsafe.Pointer(&uid)),
@@ -1649,6 +2258,7 @@ type option struct {
 	debug                    bool
 	sectorSize               uint16
 	sectorsPerAllocationUnit uint16
+	log                      log.Log
 }
 
 func newOption() *option {
@@ -1659,6 +2269,7 @@ func newOption() *option {
 		creationTime:             time.Now(),
 		sectorSize:               512,
 		sectorsPerAllocationUnit: 1,
+		log:                      log.NoLog{},
 	}
 }
 
@@ -1692,6 +2303,16 @@ func CaseSensitive(value bool) Option {
 func Debug(value bool) Option {
 	return func(o *option) {
 		o.debug = value
+	}
+}
+
+// Log sets the logger while using the filesystem.
+//
+// Unlike the Debug option, the logger logs the messages
+// internal to go-winfsp.
+func Log(log log.Log) Option {
+	return func(o *option) {
+		o.log = log
 	}
 }
 
@@ -1777,6 +2398,7 @@ func Mount(
 	// Place the reference map right now.
 	result := &FileSystem{}
 	fileSystemRef := &result.FileSystemRef
+	fileSystemRef.log = option.log
 	fileSystemAddr := uintptr(unsafe.Pointer(fileSystemRef))
 	_, loaded := refMap.LoadOrStore(fileSystemAddr, fileSystemRef)
 	if loaded {

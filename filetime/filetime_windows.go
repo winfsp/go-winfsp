@@ -28,3 +28,16 @@ func Timestamp(t time.Time) uint64 {
 func Filetime(t syscall.Filetime) uint64 {
 	return uint64FromFiletime(&t)
 }
+
+func FiletimeFromRaw(t uint64) syscall.Filetime {
+	filetime := pool.Get().(*syscall.Filetime)
+	defer pool.Put(filetime)
+	t1 := (*uint64)(unsafe.Pointer(filetime))
+	*t1 = t
+	return *filetime
+}
+
+func TimeFromRaw(t uint64) time.Time {
+	filetime := FiletimeFromRaw(t)
+	return time.Unix(0, filetime.Nanoseconds())
+}

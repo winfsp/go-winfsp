@@ -11,21 +11,29 @@ import (
 
 	"github.com/winfsp/go-winfsp"
 	"github.com/winfsp/go-winfsp/gofs"
+	"github.com/winfsp/go-winfsp/log/logrus"
 	"github.com/winfsp/go-winfsp/memfs"
 )
 
 var (
 	mountpoint string = "X:"
+	enableLog  bool   = false
 )
 
 var rootCmd = &cobra.Command{
 	Use:   "memfs",
 	Short: "Mount an In-Memory WinFSP filesystem",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		var options []winfsp.Option
+		options = append(options, winfsp.CaseSensitive(true))
+		if enableLog {
+			options = append(options, winfsp.Log(logrus.Default()))
+		}
+
 		// Create and mount the filesystem.
 		ptfs, err := winfsp.Mount(
 			gofs.New(memfs.New()), mountpoint,
-			winfsp.CaseSensitive(true),
+			options...,
 		)
 		if err != nil {
 			return errors.Wrap(err, "mount filesystem")
@@ -44,6 +52,10 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(
 		&mountpoint, "mount", "m", mountpoint,
 		"Where to mount the directory",
+	)
+	rootCmd.PersistentFlags().BoolVar(
+		&enableLog, "log", enableLog,
+		"Whether to enable logging",
 	)
 }
 
