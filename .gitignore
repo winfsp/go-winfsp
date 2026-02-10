@@ -1,1 +1,4 @@
 *.exe
+
+coverage.out
+coverage.html

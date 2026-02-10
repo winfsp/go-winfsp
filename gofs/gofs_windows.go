@@ -1,13 +1,13 @@
 package gofs
 
 import (
-	"crypto/sha256"
-	"encoding/binary"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/pkg/errors"
@@ -15,8 +15,8 @@ import (
 
 	"github.com/winfsp/go-winfsp"
 	"github.com/winfsp/go-winfsp/filetime"
-	"github.com/winfsp/go-winfsp/pathlock"
 	"github.com/winfsp/go-winfsp/procsd"
+	"github.com/winfsp/go-winfsp/treelock"
 )
 
 type File interface {
@@ -42,7 +42,7 @@ type FileSystem interface {
 }
 
 type fileHandle struct {
-	lock  *pathlock.Lock
+	node  *treelock.Node
 	dir   winfsp.DirBuffer
 	file  File
 	flags int
@@ -125,20 +125,33 @@ const (
 		AttribReadOnlyHonorSys
 )
 
+type exiledParentStat struct{}
+
+func (e *exiledParentStat) IsDir() bool        { return true }
+func (e *exiledParentStat) ModTime() time.Time { return time.Now() }
+func (e *exiledParentStat) Name() string       { return "" }
+func (e *exiledParentStat) Size() int64        { return 0 }
+func (e *exiledParentStat) Sys() any           { return nil }
+
+func (e *exiledParentStat) Mode() fs.FileMode {
+	// XXX: Once the node is exiled, it will be placed
+	// under a pseudo parent directory whose content
+	// cannot be deleted. This prevents deleting the
+	// file twice.
+	return os.FileMode(0o000)
+}
+
+var _ os.FileInfo = &exiledParentStat{}
+
 type fileSystem struct {
 	inner   FileSystem
 	handles sync.Map
-	locker  pathlock.PathLocker
+	locker  *treelock.TreeLocker
 
 	labelLen int
 	label    [32]uint16
 
 	readOnlyTransMode AttribReadOnlyTransMode
-}
-
-func (handle *fileHandle) reopenFile(fs *fileSystem) (File, error) {
-	return fs.inner.OpenFile(
-		handle.lock.FilePath(), handle.flags, os.FileMode(0))
 }
 
 func (fs *fileSystem) readOnlyBitFromSelfParentStats(
@@ -239,7 +252,7 @@ func (fs *fileSystem) needParentStat() bool {
 	return false
 }
 
-func (fs *fileSystem) fillInfoFromPath(
+func (fs *fileSystem) fillInfoFromPathLocked(
 	target *winfsp.FSP_FSCTL_FILE_INFO,
 	path string,
 	selfStat, parentStat os.FileInfo,
@@ -252,8 +265,8 @@ func (fs *fileSystem) fillInfoFromPath(
 		}
 	}
 	if parentStat == nil && fs.needParentStat() {
-		parent := filepath.Dir(pathlock.UnifyFilePath(path))
-		parent = pathlock.UnifyFilePath(parent)
+		parent := filepath.Dir(treelock.UnifyFilePath(path))
+		parent = treelock.UnifyFilePath(parent)
 		if parentStat, err = fs.inner.Stat(parent); err != nil {
 			return err
 		}
@@ -264,7 +277,9 @@ func (fs *fileSystem) fillInfoFromPath(
 	return nil
 }
 
-func (fs *fileSystem) fillInfoFromHandle(
+// fillInfoFromHandleLocked fills the information
+// with a fileHandle. Must acquire the lock.
+func (fs *fileSystem) fillInfoFromHandleLocked(
 	target *winfsp.FSP_FSCTL_FILE_INFO,
 	handle *fileHandle,
 	selfStat, parentStat os.FileInfo,
@@ -276,10 +291,36 @@ func (fs *fileSystem) fillInfoFromHandle(
 			return err
 		}
 	}
-	return fs.fillInfoFromPath(
-		target, handle.lock.FilePath(),
-		selfStat, parentStat,
-		handle.evaluatedIndex,
+	if parentStat == nil && fs.needParentStat() {
+		if handle.node.IsExile() {
+			parentStat = &exiledParentStat{}
+		} else {
+			parent := filepath.Dir(handle.node.FilePath())
+			parent = treelock.UnifyFilePath(parent)
+			if parentStat, err = fs.inner.Stat(parent); err != nil {
+				return err
+			}
+		}
+	}
+	fs.fillInfoFromSelfParentStats(
+		target, selfStat, parentStat, handle.evaluatedIndex,
+	)
+	return nil
+}
+
+// fillInfoFromHandle fills the information with
+// a fileHandle. Will lock if the parent needs stat.
+func (fs *fileSystem) fillInfoFromHandle(
+	target *winfsp.FSP_FSCTL_FILE_INFO,
+	handle *fileHandle,
+	selfStat, parentStat os.FileInfo,
+) error {
+	if parentStat == nil && fs.needParentStat() {
+		plock := handle.node.RLockPath()
+		defer plock.Unlock()
+	}
+	return fs.fillInfoFromHandleLocked(
+		target, handle, selfStat, parentStat,
 	)
 }
 
@@ -288,13 +329,15 @@ func (fs *fileSystem) GetSecurityByName(
 	flags winfsp.GetSecurityByNameFlags,
 ) (uint32, *windows.SECURITY_DESCRIPTOR, error) {
 	var err error
-	name = pathlock.UnifyFilePath(name)
+	plock := fs.locker.RLockFile(name)
+	defer plock.Unlock()
+	name = plock.FilePath()
 	info, err := fs.inner.Stat(name)
 	if err != nil || flags == winfsp.GetExistenceOnly {
 		return 0, nil, err
 	}
 	target := &winfsp.FSP_FSCTL_FILE_INFO{}
-	err = fs.fillInfoFromPath(target, name, info, nil, 0)
+	err = fs.fillInfoFromPathLocked(target, name, info, nil, 0)
 	if err != nil || flags == winfsp.GetAttributesByName {
 		return 0, nil, err
 	}
@@ -310,23 +353,6 @@ func (fs *fileSystem) GetSecurityByName(
 }
 
 var _ winfsp.BehaviourGetSecurityByName = (*fileSystem)(nil)
-
-func evaluateIndexNumber(p string) uint64 {
-	// XXX: we evaluate the index number for a file by hashing,
-	// so each file is identified by its path. Since we will not
-	// support open by file ID in this scenario, it is okay to
-	// simply map a path to its hash value.
-	//
-	// And we caches the index number right at file creation,
-	// the index number will only be available while stating an
-	// open file, not on reading directories.
-	data := sha256.Sum256([]byte(p))
-	a := binary.BigEndian.Uint64(data[0:8])
-	b := binary.BigEndian.Uint64(data[8:16])
-	c := binary.BigEndian.Uint64(data[16:24])
-	d := binary.BigEndian.Uint64(data[24:32])
-	return a ^ b ^ c ^ d
-}
 
 const (
 	// unsupportedCreateOptions are the options that are not
@@ -391,11 +417,6 @@ func (fs *fileSystem) openFile(
 	disposition := (createOptions >> 24) & 0x0ff
 	switch disposition {
 	case windows.FILE_SUPERSEDE:
-		// XXX: FILE_SUPERSEDE means to remove the file on disk
-		// and then replace it by our file, we don't support
-		// removing file while there's open file handles. But
-		// it can still be open when it is the only one to open
-		// the specified file.
 		flags |= os.O_CREATE | os.O_TRUNC
 	case windows.FILE_CREATE:
 		flags |= os.O_CREATE | os.O_EXCL
@@ -411,26 +432,44 @@ func (fs *fileSystem) openFile(
 	}
 
 	// Lock the file with desired mode.
-	lockFunc := fs.locker.RLock
+
+	// We are allowed to wait for the write operation
+	// for a more fluent user experience.
+	// TODO: create an option to control it?
+	lockFunc := fs.locker.RLockFile
 	if (createOptions&windows.FILE_DELETE_ON_CLOSE != 0) ||
 		(grantedAccess&windows.DELETE != 0) ||
 		(disposition == windows.FILE_SUPERSEDE) {
-		lockFunc = fs.locker.Lock
+		lockFunc = fs.locker.TryWLockFile
 	}
 	lock := lockFunc(name)
 	if lock == nil {
 		return 0, windows.STATUS_SHARING_VIOLATION
 	}
+	defer func() { lock.Unlock() }()
 	created := false
+	node := lock.RetainNode()
 	defer func() {
 		if !created {
-			lock.Unlock()
+			node.Free()
 		}
 	}()
 
+	// XXX: currently there's no direct interface
+	// to express the semantic of FILE_SUPERSEDE.
+	// Since the file has been opened with write
+	// lock, and no more new open file can be
+	// created before us returning, thus it
+	// suffices to check the number of references.
+	if flags&windows.FILE_SUPERSEDE != 0 {
+		if lock.CurrentRefs() > 1 {
+			return 0, windows.STATUS_ACCESS_DENIED
+		}
+	}
+
 	// Attempt to allocate the file handle.
 	handle := &fileHandle{
-		lock: lock,
+		node: node,
 	}
 	handleAddr := uintptr(unsafe.Pointer(handle))
 	_, loaded := fs.handles.LoadOrStore(handleAddr, handle)
@@ -529,21 +568,14 @@ func (fs *fileSystem) openFile(
 	default:
 	}
 
-	// Downgrade the lock to reader lock if it is the file
-	// to supersede, and other processes can access it with
-	// such flag from now on.
-	if disposition == windows.FILE_SUPERSEDE {
-		lock.Downgrade()
-	}
-
 	// Evaluate the file index for the file and cache it.
-	handle.evaluatedIndex = evaluateIndexNumber(lock.Path())
+	handle.evaluatedIndex = lock.AddrAsID()
 
 	// Copy the status out to the file information block.
 	//
 	// XXX: This must always be done after all fields in
 	// the handle are filled.
-	err = fs.fillInfoFromHandle(info, handle, fileInfo, nil)
+	err = fs.fillInfoFromHandleLocked(info, handle, fileInfo, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -603,7 +635,7 @@ func (fs *fileSystem) Close(
 	fileHandle := object.(*fileHandle)
 	fileHandle.mtx.Lock()
 	defer fileHandle.mtx.Unlock()
-	defer fileHandle.lock.Unlock()
+	defer fileHandle.node.Free()
 	defer fileHandle.dir.Delete()
 	if fileHandle.file != nil {
 		_ = fileHandle.file.Close()
@@ -685,7 +717,15 @@ func (fs *fileSystem) ReadDirectory(
 		return err
 	}
 	defer handle.unlockChecked()
-	f, err := handle.reopenFile(fs)
+	plock := handle.node.RLockPath()
+	defer plock.Unlock()
+	// If the directory has been deleted, then
+	// we will fail the read operation.
+	if plock.IsExile() {
+		return os.ErrNotExist
+	}
+	f, err := fs.inner.OpenFile(
+		plock.FilePath(), handle.flags, os.FileMode(0))
 	if err != nil {
 		return err
 	}
@@ -1027,9 +1067,23 @@ func (fs *fileSystem) CanDelete(
 		return err
 	}
 	defer handle.unlockChecked()
-	if !handle.lock.IsWrite() {
+
+	plock := handle.node.TryWLockPath()
+	if plock == nil {
 		return windows.STATUS_ACCESS_DENIED
 	}
+	defer plock.Unlock()
+	// The file has been deleted.
+	if plock.IsExile() {
+		return windows.STATUS_OBJECT_NAME_NOT_FOUND
+	}
+
+	// There's possibly node opening files under
+	// this node, which must fail the operation.
+	if plock.HasChild() {
+		return windows.STATUS_ACCESS_DENIED
+	}
+
 	fileInfo, err := handle.file.Stat()
 	if err != nil {
 		return err
@@ -1037,7 +1091,8 @@ func (fs *fileSystem) CanDelete(
 	if !fileInfo.IsDir() {
 		return nil
 	}
-	f, err := handle.reopenFile(fs)
+	f, err := fs.inner.OpenFile(
+		plock.FilePath(), handle.flags, os.FileMode(0))
 	if err != nil {
 		return err
 	}
@@ -1065,17 +1120,33 @@ func (fs *fileSystem) Cleanup(
 	if cleanupFlags&winfsp.FspCleanupDelete == 0 {
 		return
 	}
-	if !handle.lock.IsWrite() {
-		return
-	}
 	handle.mtx.Lock()
 	defer handle.mtx.Unlock()
 	if handle.file == nil {
 		return
 	}
+	plock := handle.node.TryWLockPath()
+	if plock == nil {
+		return
+	}
+	defer plock.Unlock()
+	if plock.IsExile() {
+		return
+	}
+	exile := fs.locker.AllocExile()
+	defer exile.Free()
+	exileLock := exile.TryWLockPath()
+	// assert exileLock != nil
+	if exileLock == nil {
+		panic("write lock exile node failed")
+	}
+	defer exileLock.Unlock()
 	_ = handle.file.Close()
 	handle.file = nil
-	_ = fs.inner.Remove(handle.lock.FilePath())
+	if err := fs.inner.Remove(plock.FilePath()); err != nil {
+		return
+	}
+	treelock.Exchange(plock, exileLock)
 }
 
 var _ winfsp.BehaviourCleanup = (*fileSystem)(nil)
@@ -1088,23 +1159,29 @@ func (fs *fileSystem) Rename(
 	if err != nil {
 		return err
 	}
-	if !handle.lock.IsWrite() {
-		return windows.STATUS_ACCESS_DENIED
-	}
 	handle.mtx.Lock()
 	defer handle.mtx.Unlock()
 	if handle.file == nil {
 		return windows.STATUS_INVALID_HANDLE
 	}
+	oldLock := handle.node.TryWLockPath()
+	if oldLock == nil {
+		return windows.STATUS_SHARING_VIOLATION
+	}
+	defer oldLock.Unlock()
+	if oldLock.IsExile() {
+		return windows.STATUS_OBJECT_NAME_NOT_FOUND
+	}
 
-	// Try to grab the target path's lock. And upon exit
-	// either the source or the target lock will be released.
-	newLock := fs.locker.Lock(target)
+	// Try to grab the target path's lock.
+	newLock := fs.locker.TryWLockFile(target)
 	if newLock == nil {
 		return windows.STATUS_SHARING_VIOLATION
 	}
+	defer newLock.Unlock()
+
+	// Normalize the target name.
 	target = newLock.FilePath()
-	defer func() { newLock.Unlock() }()
 
 	// Check for the rename precondition so that we could
 	// avoid performing sophiscated operations.
@@ -1119,7 +1196,10 @@ func (fs *fileSystem) Rename(
 		}
 	}
 
-	// After exit, the remaining file will be reopened and
+	// Close the file temporarily, since in some filesystem,
+	// opening the file will cause the move operation to fail.
+	//
+	// Upon exit, the remaining file will be reopened and
 	// seek to its orignal offset, so that we can continue
 	// our operations.
 	fileInfo, err := handle.file.Stat()
@@ -1138,7 +1218,13 @@ func (fs *fileSystem) Rename(
 	_ = handle.file.Close()
 	handle.file = nil
 	defer func() {
-		f, err := handle.reopenFile(fs)
+		// It's either the file moved successfully so that the
+		// handle.node get placed under the target directory,
+		// or the file failing to move so that handle.node
+		// stays in its original position. Either case we
+		// can trust the file path from handle.node.FilePath().
+		f, err := fs.inner.OpenFile(
+			handle.node.FilePath(), handle.flags, os.FileMode(0))
 		if err != nil {
 			return
 		}
@@ -1156,11 +1242,11 @@ func (fs *fileSystem) Rename(
 	}()
 
 	// Attempt to perform the rename operation now.
-	source = handle.lock.FilePath()
+	source = oldLock.FilePath()
 	if err := fs.inner.Rename(source, target); err != nil {
 		return err
 	}
-	handle.lock, newLock = newLock, handle.lock
+	treelock.Exchange(oldLock, newLock)
 	return nil
 }
 
@@ -1214,6 +1300,7 @@ func NewOptions(
 	}
 	return &fileSystem{
 		inner:             fs,
+		locker:            treelock.New(),
 		readOnlyTransMode: option.attribReadOnlyTransMode,
 	}, nil
 }

@@ -7,11 +7,8 @@
 // only read, write (append or random), close, seek, sync,
 // readdir, truncate and stat operations.
 //
-// On the filesystem level, it supports Name, Stat,
-// OpenFile, Mkdir, Remove and Rename operations.
-// Rename operation must not select to replace the target
-// file or not. Both Remove and Rename operations will
-// never be called when there's open file under it.
+// On the filesystem level, it supports Stat, OpenFile,
+// Mkdir, Remove and Rename operations.
 //
 // This makes it works even if the underlying file system
 // is backed by a Window's native directory through the
