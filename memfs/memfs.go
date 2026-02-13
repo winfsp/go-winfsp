@@ -509,10 +509,6 @@ func (m *MemFS) Rename(src string, tgt string) error {
 		return err
 	}
 
-	if _, ok := tgtDir.dentries[tgtBase]; ok {
-		return os.ErrExist
-	}
-
 	if (tgtItem.mode.Perm() & 0200) == 0 {
 		return windows.STATUS_ACCESS_DENIED
 	}
