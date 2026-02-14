@@ -4,14 +4,11 @@ import (
 	"io"
 	"math"
 	"os"
-	"path/filepath"
 	"reflect"
 	"runtime"
-	"slices"
 	"sync"
 	"syscall"
 	"time"
-	"unicode/utf16"
 	"unsafe"
 
 	"github.com/pkg/errors"
@@ -853,6 +850,14 @@ var (
 	fillDirectoryBuffer    dllProc
 )
 
+func init() {
+	registerProc("FspFileSystemDeleteDirectoryBuffer", &deleteDirectoryBuffer)
+	registerProc("FspFileSystemAcquireDirectoryBuffer", &acquireDirectoryBuffer)
+	registerProc("FspFileSystemReleaseDirectoryBuffer", &releaseDirectoryBuffer)
+	registerProc("FspFileSystemReadDirectoryBuffer", &readDirectoryBuffer)
+	registerProc("FspFileSystemFillDirectoryBuffer", &fillDirectoryBuffer)
+}
+
 // DirBuffer is the directory buffer block which can be
 // operated WinFSP's directory info API.
 //
@@ -882,6 +887,8 @@ func (buf *DirBuffer) ReadDirectory(
 		slice.Data, uintptr(slice.Len),
 		uintptr(unsafe.Pointer(&bytesTransferred)),
 	)
+	runtime.KeepAlive(marker)
+	runtime.KeepAlive(buffer)
 	return int(bytesTransferred)
 }
 
@@ -1246,17 +1253,12 @@ var go_delegateCreateEx = syscall.NewCallbackCDecl(func(
 })
 
 var (
-	posixMapSecurityDescriptorToPermissions dllProc
-	posixMapSidToUid                        dllProc
-	posixMapUidToSid                        dllProc
-	setSecurityDescriptor                   dllProc
-	deleteSecurityDescriptor                dllProc
-	fileSystemOperationProcessId            dllProc
-	fileSystemResolveReparsePoints          dllProc
-	fileSystemFindReparsePoint              dllProc
-	debugLogSetHandle                       dllProc
-	fileSystemSetDebugLogF                  dllProc
+	fileSystemResolveReparsePoints dllProc
 )
+
+func init() {
+	registerProc("FspFileSystemResolveReparsePoints", &fileSystemResolveReparsePoints)
+}
 
 // BehaviourDeleteReparsePoint deletes a reparse point.
 type BehaviourDeleteReparsePoint interface {
@@ -1343,6 +1345,9 @@ func delegateGetReparsePointByName(
 	ref := loadFileSystemRef(fileSystem)
 	if ref == nil {
 		return ntStatusNoRef
+	}
+	if ref.getReparsePointByName == nil {
+		return windows.STATUS_INVALID_DEVICE_REQUEST
 	}
 	var bufferSize int
 	if size != nil {
@@ -1440,207 +1445,9 @@ var go_delegateSetReparsePoint = syscall.NewCallbackCDecl(func(
 	))
 })
 
-// PosixMapSecurityDescriptorToPermissions maps a Windows security descriptor to POSIX permissions.
-func PosixMapSecurityDescriptorToPermissions(securityDescriptor *windows.SECURITY_DESCRIPTOR) (uid, gid, mode uint32, err error) {
-	err = posixMapSecurityDescriptorToPermissions.CallStatus(
-		uintptr(unsafe.Pointer(securityDescriptor)),
-		uintptr(unsafe.Pointer(&uid)),
-		uintptr(unsafe.Pointer(&gid)),
-		uintptr(unsafe.Pointer(&mode)),
-	)
-
-	if err != nil {
-		return 0, 0, 0, errors.Wrap(err, "FspPosixMapSecurityDescriptorToPermissions")
-	}
-
-	return uid, gid, mode, nil
-}
-
-// PosixMapSidToUid maps a Windows SID to a POSIX UID.
-func PosixMapSidToUid(sid *windows.SID) (uint32, error) {
-	var uid uint32
-	err := posixMapSidToUid.CallStatus(
-		uintptr(unsafe.Pointer(sid)),
-		uintptr(unsafe.Pointer(&uid)),
-	)
-	if err != nil {
-		return 0, errors.Wrap(err, "FspPosixMapSidToUid")
-	}
-	return uid, nil
-}
-
-// PosixMapUidToSid maps a POSIX UID to a Windows SID.
-func PosixMapUidToSid(uid uint32) (*windows.SID, error) {
-	var sid *windows.SID
-	err := posixMapUidToSid.CallStatus(
-		uintptr(uid),
-		uintptr(unsafe.Pointer(&sid)),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "FspPosixMapUidToSid")
-	}
-	return sid, nil
-}
-
-// SetSecurityDescriptor modifies a security descriptor.
-//
-// This is a helper for implementing the SetSecurity operation.
-// It modifies an input security descriptor based on the provided
-// security information and modification descriptor.
-//
-// The windows.SECURITY_DESCRIPTOR returned by this function must be
-// manually freed by invoking DeleteSecurityDescriptor.
-func SetSecurityDescriptor(
-	inputDescriptor *windows.SECURITY_DESCRIPTOR,
-	securityInformation windows.SECURITY_INFORMATION,
-	modificationDescriptor *windows.SECURITY_DESCRIPTOR,
-) (*windows.SECURITY_DESCRIPTOR, error) {
-	var outputDescriptor *windows.SECURITY_DESCRIPTOR
-	err := setSecurityDescriptor.CallStatus(
-		uintptr(unsafe.Pointer(inputDescriptor)),
-		uintptr(securityInformation),
-		uintptr(unsafe.Pointer(modificationDescriptor)),
-		uintptr(unsafe.Pointer(&outputDescriptor)),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "FspSetSecurityDescriptor")
-	}
-	return outputDescriptor, nil
-}
-
-// DeleteSecurityDescriptor deletes a security descriptor.
-//
-// This is a helper for cleaning up security descriptors created
-// by SetSecurityDescriptor.
-func DeleteSecurityDescriptor(securityDescriptor *windows.SECURITY_DESCRIPTOR) error {
-	// Pass a function pointer to indicate this was created by FspSetSecurityDescriptor
-	// The C API expects this to match the function that created the descriptor
-	_, err := deleteSecurityDescriptor.Call(
-		uintptr(unsafe.Pointer(securityDescriptor)),
-		uintptr(unsafe.Pointer(setSecurityDescriptor.proc)),
-	)
-
-	return err
-}
-
-// DebugLogSetHandle sets the debug log handle for WinFSP debugging output.
-//
-// This function sets the handle where debug messages will be written when debug
-// logging is enabled. The handle should be a valid Windows file handle.
-func DebugLogSetHandle(handle syscall.Handle) error {
-	if err := tryLoadWinFSP(); err != nil {
-		return err
-	}
-	_, err := debugLogSetHandle.Call(uintptr(handle))
-	return err
-}
-
-// FileSystemOperationProcessId gets the originating process ID.
-//
-// Valid only during Create, Open and Rename requests when the target exists.
-// This function can only be called from within a file system operation handler.
-func FileSystemOperationProcessId() uint32 {
-	result, _ := fileSystemOperationProcessId.Call()
-	return uint32(result)
-}
-
-func FileSystemFindReparsePoint(
-	fileSystem *FileSystemRef, fileName string,
-) (bool, uint32, error) {
-	utf16FileName, err := windows.UTF16PtrFromString(fileName)
-	if err != nil {
-		return false, 0, errors.Wrap(err, "convert filename to UTF16")
-	}
-
-	var reparsePointIndex uint32
-
-	result, err := fileSystemFindReparsePoint.Call(
-		uintptr(unsafe.Pointer(fileSystem.fileSystem)), // FileSystem
-		go_delegateGetReparsePointByName,               // GetReparsePointByName callback
-		uintptr(0),                                     // Context (unused)
-		uintptr(unsafe.Pointer(utf16FileName)),         // FileName
-		uintptr(unsafe.Pointer(&reparsePointIndex)),    // PReparsePointIndex
-	)
-
-	if err != nil {
-		return false, 0, errors.Wrap(err, "FspFileSystemFindReparsePoint")
-	}
-	return byte(result) != 0, reparsePointIndex, nil
-}
-
-const (
-	dirInfoAlignment uint16 = uint16(unsafe.Alignof(FSP_FSCTL_DIR_INFO{}))
-	replacementChar         = '\uFFFD' // Unicode replacement character
-)
-
-// FileSystemAddDirInfo adds directory information to a buffer like
-// FspFileSystemAddDirInfo.
-func FileSystemAddDirInfo(
-	name string,
-	nextOffset uint64,
-	fileInfo *FSP_FSCTL_FILE_INFO,
-	buffer []byte,
-) int {
-	if fileInfo == nil {
-		// Then we just need to write two null bytes.
-		if len(buffer) < 2 {
-			return 0
-		}
-		buffer[0] = 0
-		buffer[1] = 0
-		return 2
-	}
-
-	var utf16Len uint16
-	for _, r := range name {
-		switch utf16.RuneLen(r) {
-		case 1:
-			utf16Len++
-		case 2:
-			utf16Len += 2
-		default:
-			utf16Len++
-		}
-	}
-
-	dirInfoSize := uint16(unsafe.Sizeof(FSP_FSCTL_DIR_INFO{}))
-	requiredSize := dirInfoSize + utf16Len*SIZEOF_WCHAR
-	alignedSize := (requiredSize + dirInfoAlignment - 1) & ^(dirInfoAlignment - 1)
-	if uint16(len(buffer)) < alignedSize {
-		return 0
-	}
-
-	di := (*FSP_FSCTL_DIR_INFO)(unsafe.Pointer(&buffer[0]))
-	di.FileInfo = *fileInfo
-	di.NextOffset = nextOffset
-	di.Padding0 = 0
-	di.Padding1 = 0
-	di.Size = requiredSize
-
-	// Encode the string directly into the buffer as UTF-16
-	var utf16Buffer []uint16 = unsafe.Slice((*uint16)(unsafe.Pointer(&buffer[dirInfoSize])), utf16Len)
-	utf16Index := 0
-	for _, r := range name {
-		switch utf16.RuneLen(r) {
-		case 1:
-			utf16Buffer[utf16Index] = uint16(r)
-			utf16Index++
-		case 2:
-			r1, r2 := utf16.EncodeRune(r)
-			utf16Buffer[utf16Index] = uint16(r1)
-			utf16Buffer[utf16Index+1] = uint16(r2)
-			utf16Index += 2
-		default:
-			utf16Buffer[utf16Index] = uint16(replacementChar)
-			utf16Index++
-		}
-	}
-
-	return int(alignedSize)
-}
-
 type option struct {
 	caseSensitive            bool
+	casePreserveNames        bool
 	volumePrefix             string
 	fileSystemName           string
 	passPattern              bool
@@ -1674,7 +1481,7 @@ func Attributes(value uint32) Option {
 }
 
 // CaseSensitive is used to indicate whether the underlying
-// file system can be distinguied case sensitively.
+// filesystem can be distinguied case sensitively.
 //
 // This value should be set depending on your filesystem's
 // implementation. On windows, it is very likely that the
@@ -1683,6 +1490,19 @@ func Attributes(value uint32) Option {
 func CaseSensitive(value bool) Option {
 	return func(o *option) {
 		o.caseSensitive = value
+	}
+}
+
+// CasePreserveNames is used to indicate whether the underlying
+// filesystem preserve cases when storing file names.
+//
+// This value should be set depending on your filesystem's
+// implementation.  On windows, it is very likely that the
+// filesystem does not preserve cases while storing names,
+// so we set this value to false by default.
+func CasePreserveNames(value bool) Option {
+	return func(o *option) {
+		o.casePreserveNames = value
 	}
 }
 
@@ -1757,7 +1577,17 @@ var (
 	setMountPoint    dllProc
 	startDispatcher  dllProc
 	stopDispatcher   dllProc
+	setDebugLogF     dllProc
 )
+
+func init() {
+	registerProc("FspFileSystemCreate", &fileSystemCreate)
+	registerProc("FspFileSystemDelete", &fileSystemDelete)
+	registerProc("FspFileSystemSetMountPoint", &setMountPoint)
+	registerProc("FspFileSystemStartDispatcher", &startDispatcher)
+	registerProc("FspFileSystemStopDispatcher", &stopDispatcher)
+	registerProc("FspFileSystemSetDebugLogF", &setDebugLogF)
+}
 
 // Mount attempts to mount a file system to specified mount
 // point, returning the handle to the real filesystem.
@@ -1790,6 +1620,9 @@ func Mount(
 	attributes := option.attributes
 	if option.caseSensitive {
 		attributes |= FspFSAttributeCaseSensitive
+	}
+	if option.casePreserveNames {
+		attributes |= FspFSAttributeCasePreservedNames
 	}
 	attributes |= FspFSAttributeUnicodeOnDisk
 	attributes |= FspFSAttributePersistentAcls
@@ -1949,7 +1782,7 @@ func Mount(
 
 	// Convert and file the volume parameters for mounting.
 	volumeParams := &FSP_FSCTL_VOLUME_PARAMS_V1{}
-	sizeOfVolumeParamsV1 := uint16(unsafe.Sizeof(
+	const sizeOfVolumeParamsV1 = uint16(unsafe.Sizeof(
 		FSP_FSCTL_VOLUME_PARAMS_V1{}))
 	volumeParams.SizeOfVolumeParamsV1 = sizeOfVolumeParamsV1
 	volumeParams.SectorSize = option.sectorSize
@@ -1970,6 +1803,8 @@ func Mount(
 		uintptr(unsafe.Pointer(&result.fileSystem)),
 	)
 	runtime.KeepAlive(utf16Driver)
+	runtime.KeepAlive(volumeParams)
+	runtime.KeepAlive(fileSystemOps)
 	if err != nil {
 		return nil, errors.Wrap(err, "create file system")
 	}
@@ -1983,7 +1818,7 @@ func Mount(
 
 	if option.debug {
 		// Set debug log level to maximum for debug output
-		_, err = fileSystemSetDebugLogF.Call(
+		_, err = setDebugLogF.Call(
 			uintptr(unsafe.Pointer(result.fileSystem)),
 			uintptr(math.MaxUint32),
 		)
@@ -2027,291 +1862,4 @@ func (f *FileSystem) Unmount() {
 	fileSystem := uintptr(unsafe.Pointer(f.fileSystem))
 	_, _ = stopDispatcher.Call(fileSystem)
 	_, _ = fileSystemDelete.Call(fileSystem)
-}
-
-// BinPath returns the path to the bin folder where WinFSP is
-// installed.
-func BinPath() (string, error) {
-	// Well, we must lookup the registry to find our
-	// winFSP installation now.
-	findInstallError := func(err error) error {
-		return errors.Wrapf(err, "winfsp find installation")
-	}
-	var keyReg syscall.Handle // HKLM\\Software\\WinFSP
-	keyName, err := syscall.UTF16PtrFromString("Software\\WinFsp")
-	if err != nil {
-		return "", findInstallError(err)
-	}
-	if err := syscall.RegOpenKeyEx(
-		syscall.HKEY_LOCAL_MACHINE, keyName, 0,
-		syscall.KEY_READ|syscall.KEY_WOW64_32KEY, &keyReg,
-	); err != nil {
-		return "", findInstallError(err)
-	}
-	defer syscall.RegCloseKey(keyReg)
-	valueName, err := syscall.UTF16PtrFromString("InstallDir")
-	if err != nil {
-		return "", findInstallError(err)
-	}
-	var pathBuf [syscall.MAX_PATH]uint16
-	var valueType, valueSize uint32
-	valueSize = uint32(len(pathBuf)) * SIZEOF_WCHAR
-	if err := syscall.RegQueryValueEx(
-		keyReg, valueName, nil, &valueType,
-		(*byte)(unsafe.Pointer(&pathBuf)), &valueSize,
-	); err != nil {
-		return "", findInstallError(err)
-	}
-	if valueType != syscall.REG_SZ {
-		return "", findInstallError(syscall.ERROR_MOD_NOT_FOUND)
-	}
-	path := pathBuf[:int(valueSize/SIZEOF_WCHAR)]
-	if len(path) > 0 && path[len(path)-1] == 0 {
-		path = path[:len(path)-1]
-	}
-	return filepath.Join(syscall.UTF16ToString(path), "bin"), nil
-}
-
-func loadSignedDLL(dllPath string) (*syscall.DLL, error) {
-	var err error
-	absDLLPath, err := filepath.Abs(dllPath)
-	if err != nil {
-		return nil, errors.Wrapf(err, "resolve path %q", dllPath)
-	}
-	dllPath = absDLLPath
-
-	u16Path, err := syscall.UTF16PtrFromString(dllPath)
-	if err != nil {
-		return nil, errors.Wrapf(err, "encode path %q", dllPath)
-	}
-
-	fh, err := windows.CreateFile(
-		u16Path,
-		windows.FILE_GENERIC_READ,
-		// Forbid other process from WRITE|DELETE.
-		windows.FILE_SHARE_READ,
-		nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_OPEN_REPARSE_POINT|windows.FILE_NON_DIRECTORY_FILE,
-		windows.Handle(0),
-	)
-	if err != nil {
-		return nil, errors.Wrapf(err, "open file %q", dllPath)
-	}
-	defer windows.CloseHandle(fh)
-
-	var winTrustFileInfo windows.WinTrustFileInfo
-	winTrustFileInfo.Size = uint32(unsafe.Sizeof(winTrustFileInfo))
-	winTrustFileInfo.File = fh
-	winTrustFileInfo.KnownSubject = nil
-
-	var winTrustData windows.WinTrustData
-	winTrustData.Size = uint32(unsafe.Sizeof(winTrustData))
-	winTrustData.PolicyCallbackData = uintptr(0)
-	winTrustData.SIPClientData = uintptr(0)
-	winTrustData.UIChoice = windows.WTD_UI_NONE
-	winTrustData.RevocationChecks = windows.WTD_REVOKE_WHOLECHAIN
-	winTrustData.StateAction = windows.WTD_STATEACTION_VERIFY
-	winTrustData.StateData = windows.Handle(0)
-	winTrustData.URLReference = nil
-	winTrustData.UIContext = 0
-
-	winTrustData.FileOrCatalogOrBlobOrSgnrOrCert = unsafe.Pointer(&winTrustFileInfo)
-	winTrustData.UnionChoice = windows.WTD_CHOICE_FILE
-
-	err = windows.WinVerifyTrustEx(
-		windows.InvalidHWND,
-		&windows.WINTRUST_ACTION_GENERIC_VERIFY_V2,
-		&winTrustData,
-	)
-	defer func() {
-		winTrustData.StateAction = windows.WTD_STATEACTION_CLOSE
-		_ = windows.WinVerifyTrustEx(
-			windows.InvalidHWND,
-			&windows.WINTRUST_ACTION_GENERIC_VERIFY_V2,
-			&winTrustData,
-		)
-	}()
-	if err != nil {
-		return nil, errors.Wrapf(err, "verify signature %q", dllPath)
-	}
-
-	// XXX: the dependency DLLs of WinFSP is still prone to
-	// DLL hijacking, but protecting WinFSP DLL directory
-	// is now the responsibility of user.
-	hdll, err := windows.LoadLibraryEx(
-		dllPath, windows.Handle(0),
-		windows.LOAD_LIBRARY_SEARCH_SYSTEM32|windows.LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
-	)
-	if err != nil {
-		return nil, errors.Wrapf(err, "load library %q", dllPath)
-	}
-	return &syscall.DLL{
-		Name:   dllPath,
-		Handle: syscall.Handle(hdll),
-	}, nil
-}
-
-// loadWinFSPDLL attempts to locate and load the DLL, the
-// library handle will be available from now on.
-func loadWinFSPDLL() (*syscall.DLL, error) {
-	if winFSPDLL != nil {
-		return winFSPDLL, nil
-	}
-	dllName := ""
-	switch runtime.GOARCH {
-	case "arm64":
-		dllName = "winfsp-a64.dll"
-	case "amd64":
-		dllName = "winfsp-x64.dll"
-	case "386":
-		dllName = "winfsp-x86.dll"
-	}
-	if dllName == "" {
-		// Current platform does not have winfsp shipped
-		// with it, and we can only report the error.
-		return nil, errors.Errorf(
-			"winfsp unsupported arch %q", runtime.GOARCH)
-	}
-
-	installPath, err := BinPath()
-	if err != nil {
-		return nil, err
-	}
-	return loadSignedDLL(filepath.Join(installPath, dllName))
-}
-
-// dllProc is a wrapper around a syscall.Proc with more conventional error
-// return values. See dllProc.Call below for details.
-type dllProc struct {
-	proc *syscall.Proc
-}
-
-// ntStatusPtr is a sentinel value used by dllProc.Call to indicate an argument
-// that should be a pointer to an NTstatus out variable.
-var ntStatusPtrTarget windows.NTStatus
-var ntStatusPtr = uintptr(unsafe.Pointer(&ntStatusPtrTarget))
-
-// Call is like syscall.Proc.Call but instead of always returning a non-nil error interface
-// value (even on success), this Call wrapper returns a nil error on success. It also
-// only returns one non-error result parameter, instead of two, as no callers require
-// more than one result value.
-//
-// Additionally, if an arg is the sentinel value ntStatusPtr, it will be replaced
-// with a pointer to a local NTStatus variable to capture the NTStatus return
-// and return it as an error if it's not STATUS_SUCCESS.
-//
-// When the error is non-nil, it's always of type syscall.Errno, like
-// syscall.Proc.Call.
-func (p dllProc) Call(args ...uintptr) (uintptr, error) {
-	var ntStatus windows.NTStatus
-	statusIdx := slices.Index(args, ntStatusPtr)
-	if statusIdx != -1 {
-		args[statusIdx] = uintptr(unsafe.Pointer(&ntStatus))
-	}
-	res1, _, err := p.proc.Call(args...)
-	if err == syscall.Errno(0) {
-		err = nil
-	}
-	if err == nil && statusIdx != -1 && ntStatus != windows.STATUS_SUCCESS {
-		err = ntStatus
-	}
-	return res1, err
-}
-
-// CallStatus is like syscall.Proc.Call1 but is used for procedures that return a
-// NTSTATUS status code in the first return value, which if non-STATUS_SUCCESS,
-// is returned as an error.
-func (p dllProc) CallStatus(args ...uintptr) error {
-	res1, err := p.Call(args...)
-	if err != nil {
-		return err
-	}
-	if res1 != uintptr(windows.STATUS_SUCCESS) {
-		return windows.NTStatus(res1)
-	}
-	return nil
-}
-
-var winFSPDLL *syscall.DLL
-
-func findProc(name string, target *dllProc) error {
-	proc, err := winFSPDLL.FindProc(name)
-	if err != nil {
-		return errors.Wrapf(err,
-			"winfsp cannot find proc %q", name)
-	}
-	*target = dllProc{proc: proc}
-	return nil
-}
-
-func loadProcs(procs map[string]*dllProc) error {
-	for name, proc := range procs {
-		if err := findProc(name, proc); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func initWinFSP() error {
-	dll, err := loadWinFSPDLL()
-	if err != nil {
-		return err
-	}
-	winFSPDLL = dll
-	return loadProcs(map[string]*dllProc{
-		"FspFileSystemDeleteDirectoryBuffer":         &deleteDirectoryBuffer,
-		"FspFileSystemAcquireDirectoryBuffer":        &acquireDirectoryBuffer,
-		"FspFileSystemReleaseDirectoryBuffer":        &releaseDirectoryBuffer,
-		"FspFileSystemReadDirectoryBuffer":           &readDirectoryBuffer,
-		"FspFileSystemFillDirectoryBuffer":           &fillDirectoryBuffer,
-		"FspDebugLogSetHandle":                       &debugLogSetHandle,
-		"FspDeleteSecurityDescriptor":                &deleteSecurityDescriptor,
-		"FspFileSystemCreate":                        &fileSystemCreate,
-		"FspFileSystemDelete":                        &fileSystemDelete,
-		"FspFileSystemFindReparsePoint":              &fileSystemFindReparsePoint,
-		"FspFileSystemOperationProcessIdF":           &fileSystemOperationProcessId,
-		"FspFileSystemResolveReparsePoints":          &fileSystemResolveReparsePoints,
-		"FspFileSystemSetDebugLogF":                  &fileSystemSetDebugLogF,
-		"FspFileSystemSetMountPoint":                 &setMountPoint,
-		"FspFileSystemStartDispatcher":               &startDispatcher,
-		"FspFileSystemStopDispatcher":                &stopDispatcher,
-		"FspPosixMapSecurityDescriptorToPermissions": &posixMapSecurityDescriptorToPermissions,
-		"FspPosixMapSidToUid":                        &posixMapSidToUid,
-		"FspPosixMapUidToSid":                        &posixMapUidToSid,
-		"FspSetSecurityDescriptor":                   &setSecurityDescriptor,
-	})
-}
-
-var (
-	tryLoadOnce sync.Once
-	tryLoadErr  error
-)
-
-// tryLoadWinFSP attempts to load the WinFSP DLL, the work
-// is done once and error will be persistent.
-func tryLoadWinFSP() error {
-	tryLoadOnce.Do(func() {
-		tryLoadErr = initWinFSP()
-	})
-	return tryLoadErr
-}
-
-// LoadWinFSPWithDLL will try to resolve the symbols with
-// the DLL provided, the work is done once and the error
-// will be persistent.
-//
-// If the default WinFSP loading process does not work
-// for you, then explicitly specifying one is the only
-// choice. But you have to take your own risk now.
-func LoadWinFSPWithDLL(dll *syscall.DLL) error {
-	winFSPDLL = dll
-	return tryLoadWinFSP()
-}
-
-// LoadWinFSP will load the WinFSP DLL and resolve its
-// symbolds immediately.
-func LoadWinFSP() error {
-	return LoadWinFSPWithDLL(nil)
 }
