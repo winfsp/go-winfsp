@@ -258,6 +258,8 @@ var dllProcRegistry []dllProcRegistryItem
 
 // registerProc registers a dllProc to be resolved
 // upon loading winFSPDLL.
+//
+// Must only be called from a init() function.
 func registerProc(name string, target *dllProc) {
 	dllProcRegistry = append(dllProcRegistry, dllProcRegistryItem{
 		name:   name,

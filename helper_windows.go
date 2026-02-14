@@ -26,6 +26,11 @@ func init() {
 }
 
 // PosixMapSecurityDescriptorToPermissions maps a Windows security descriptor to POSIX permissions.
+//
+// Will load WinFSP DLL if it has not been loaded, and **panic** if it
+// fails to load. If you don't want to panic, you should consider calling
+// `LoadWinFSP` or `LoadWinFSPWithDLL` and avoid calling this function
+// if it fails to load.
 func PosixMapSecurityDescriptorToPermissions(
 	securityDescriptor *windows.SECURITY_DESCRIPTOR,
 ) (uid, gid, mode uint32, err error) {
@@ -50,6 +55,11 @@ func init() {
 }
 
 // PosixMapSidToUid maps a Windows SID to a POSIX UID.
+//
+// Will load WinFSP DLL if it has not been loaded, and **panic** if it
+// fails to load. If you don't want to panic, you should consider calling
+// `LoadWinFSP` or `LoadWinFSPWithDLL` and avoid calling this function
+// if it fails to load.
 func PosixMapSidToUid(sid *windows.SID) (uint32, error) {
 	var uid uint32
 	err := posixMapSidToUid.CallStatus(
@@ -70,6 +80,11 @@ func init() {
 }
 
 // PosixMapUidToSid maps a POSIX UID to a Windows SID.
+//
+// Will load WinFSP DLL if it has not been loaded, and **panic** if it
+// fails to load. If you don't want to panic, you should consider calling
+// `LoadWinFSP` or `LoadWinFSPWithDLL` and avoid calling this function
+// if it fails to load.
 func PosixMapUidToSid(uid uint32) (*windows.SID, error) {
 	var sid *windows.SID
 	err := posixMapUidToSid.CallStatus(
@@ -96,6 +111,11 @@ func init() {
 //
 // The windows.SECURITY_DESCRIPTOR returned by this function must be
 // manually freed by invoking DeleteSecurityDescriptor.
+//
+// Will load WinFSP DLL if it has not been loaded, and **panic** if it
+// fails to load. If you don't want to panic, you should consider calling
+// `LoadWinFSP` or `LoadWinFSPWithDLL` and avoid calling this function
+// if it fails to load.
 func SetSecurityDescriptor(
 	inputDescriptor *windows.SECURITY_DESCRIPTOR,
 	securityInformation windows.SECURITY_INFORMATION,
@@ -126,6 +146,11 @@ func init() {
 //
 // This is a helper for cleaning up security descriptors created
 // by SetSecurityDescriptor.
+//
+// Will load WinFSP DLL if it has not been loaded, and **panic** if it
+// fails to load. If you don't want to panic, you should consider calling
+// `LoadWinFSP` or `LoadWinFSPWithDLL` and avoid calling this function
+// if it fails to load.
 func DeleteSecurityDescriptor(securityDescriptor *windows.SECURITY_DESCRIPTOR) error {
 	// Since we will be referring to setSecurityDescriptor.proc
 	// later, which must be initialized.
@@ -154,6 +179,11 @@ func init() {
 //
 // This function sets the handle where debug messages will be written when debug
 // logging is enabled. The handle should be a valid Windows file handle.
+//
+// Will load WinFSP DLL if it has not been loaded, and **panic** if it
+// fails to load. If you don't want to panic, you should consider calling
+// `LoadWinFSP` or `LoadWinFSPWithDLL` and avoid calling this function
+// if it fails to load.
 func DebugLogSetHandle(handle syscall.Handle) error {
 	_, err := debugLogSetHandle.Call(uintptr(handle))
 	if err != nil {
@@ -172,6 +202,11 @@ func init() {
 //
 // Valid only during Create, Open and Rename requests when the target exists.
 // This function can only be called from within a file system operation handler.
+//
+// Will load WinFSP DLL if it has not been loaded, and **panic** if it
+// fails to load. If you don't want to panic, you should consider calling
+// `LoadWinFSP` or `LoadWinFSPWithDLL` and avoid calling this function
+// if it fails to load.
 func FileSystemOperationProcessId() uint32 {
 	result, _ := fileSystemOperationProcessId.Call()
 	return uint32(result)
@@ -215,6 +250,11 @@ func (fileSystem *FileSystemRef) FindReparsePoint(
 // FileSystemFindReparsePoint delegates the operation (most
 // likely GetSecurityByName) to the underlying
 // BehaviourGetReparsePointByName.GetReparsePointByName.
+//
+// Will load WinFSP DLL if it has not been loaded, and **panic** if it
+// fails to load. If you don't want to panic, you should consider calling
+// `LoadWinFSP` or `LoadWinFSPWithDLL` and avoid calling this function
+// if it fails to load.
 //
 // Deprecated: Use FileSystemRef.FindReparsePoint. Will be
 // removed in the later versions.
