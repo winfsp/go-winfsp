@@ -1447,6 +1447,7 @@ var go_delegateSetReparsePoint = syscall.NewCallbackCDecl(func(
 
 type option struct {
 	caseSensitive            bool
+	casePreserveNames        bool
 	volumePrefix             string
 	fileSystemName           string
 	passPattern              bool
@@ -1480,7 +1481,7 @@ func Attributes(value uint32) Option {
 }
 
 // CaseSensitive is used to indicate whether the underlying
-// file system can be distinguied case sensitively.
+// filesystem can be distinguied case sensitively.
 //
 // This value should be set depending on your filesystem's
 // implementation. On windows, it is very likely that the
@@ -1489,6 +1490,19 @@ func Attributes(value uint32) Option {
 func CaseSensitive(value bool) Option {
 	return func(o *option) {
 		o.caseSensitive = value
+	}
+}
+
+// CasePreserveNames is used to indicate whether the underlying
+// filesystem preserve cases when storing file names.
+//
+// This value should be set depending on your filesystem's
+// implementation.  On windows, it is very likely that the
+// filesystem does not preserve cases while storing names,
+// so we set this value to false by default.
+func CasePreserveNames(value bool) Option {
+	return func(o *option) {
+		o.casePreserveNames = value
 	}
 }
 
@@ -1606,6 +1620,9 @@ func Mount(
 	attributes := option.attributes
 	if option.caseSensitive {
 		attributes |= FspFSAttributeCaseSensitive
+	}
+	if option.casePreserveNames {
+		attributes |= FspFSAttributeCasePreservedNames
 	}
 	attributes |= FspFSAttributeUnicodeOnDisk
 	attributes |= FspFSAttributePersistentAcls
