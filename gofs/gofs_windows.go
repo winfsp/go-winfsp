@@ -1290,6 +1290,15 @@ func WithAttribReadOnlyTransMode(mode AttribReadOnlyTransMode) NewOption {
 	}
 }
 
+func (fs *fileSystem) DefaultOptions() []winfsp.Option {
+	return []winfsp.Option{
+		winfsp.CaseSensitive(true),
+		winfsp.CasePreserveNames(true),
+	}
+}
+
+var _ winfsp.BehaviourDefaultOptions = (*fileSystem)(nil)
+
 // NewOptions create the file system with
 // the provided `gofs.FileSystem` and a
 // variadic array of options.
