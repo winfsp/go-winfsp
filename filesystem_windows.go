@@ -1344,6 +1344,9 @@ func delegateGetReparsePointByName(
 	if ref == nil {
 		return ntStatusNoRef
 	}
+	if ref.getReparsePointByName == nil {
+		return windows.STATUS_INVALID_DEVICE_REQUEST
+	}
 	var bufferSize int
 	if size != nil {
 		bufferSize = int(*size)
