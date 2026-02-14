@@ -887,6 +887,8 @@ func (buf *DirBuffer) ReadDirectory(
 		slice.Data, uintptr(slice.Len),
 		uintptr(unsafe.Pointer(&bytesTransferred)),
 	)
+	runtime.KeepAlive(marker)
+	runtime.KeepAlive(buffer)
 	return int(bytesTransferred)
 }
 
@@ -1763,7 +1765,7 @@ func Mount(
 
 	// Convert and file the volume parameters for mounting.
 	volumeParams := &FSP_FSCTL_VOLUME_PARAMS_V1{}
-	sizeOfVolumeParamsV1 := uint16(unsafe.Sizeof(
+	const sizeOfVolumeParamsV1 = uint16(unsafe.Sizeof(
 		FSP_FSCTL_VOLUME_PARAMS_V1{}))
 	volumeParams.SizeOfVolumeParamsV1 = sizeOfVolumeParamsV1
 	volumeParams.SectorSize = option.sectorSize
@@ -1784,6 +1786,8 @@ func Mount(
 		uintptr(unsafe.Pointer(&result.fileSystem)),
 	)
 	runtime.KeepAlive(utf16Driver)
+	runtime.KeepAlive(volumeParams)
+	runtime.KeepAlive(fileSystemOps)
 	if err != nil {
 		return nil, errors.Wrap(err, "create file system")
 	}
