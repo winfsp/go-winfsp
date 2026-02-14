@@ -659,11 +659,7 @@ func TestExchange(t *testing.T) {
 		assert.NotNil(wlock1)
 		defer wlock1.Unlock()
 
-		node2 := tl.AllocExile()
-		assert.NotNil(node2)
-		defer node2.Free()
-
-		wlock2 := node2.TryWLockPath()
+		wlock2 := tl.WLockExile()
 		assert.NotNil(wlock2)
 		defer wlock2.Unlock()
 
@@ -711,19 +707,11 @@ func TestExchange(t *testing.T) {
 	}()
 
 	func() {
-		node1 := tl.AllocExile()
-		assert.NotNil(node1)
-		defer node1.Free()
-
-		wlock1 := node1.TryWLockPath()
+		wlock1 := tl.WLockExile()
 		assert.NotNil(wlock1)
 		defer wlock1.Unlock()
 
-		node2 := tl.AllocExile()
-		assert.NotNil(node2)
-		defer node2.Free()
-
-		wlock2 := node2.TryWLockPath()
+		wlock2 := tl.WLockExile()
 		assert.NotNil(wlock2)
 		defer wlock2.Unlock()
 

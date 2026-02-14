@@ -1133,13 +1133,7 @@ func (fs *fileSystem) Cleanup(
 	if plock.IsExile() {
 		return
 	}
-	exile := fs.locker.AllocExile()
-	defer exile.Free()
-	exileLock := exile.TryWLockPath()
-	// assert exileLock != nil
-	if exileLock == nil {
-		panic("write lock exile node failed")
-	}
+	exileLock := fs.locker.WLockExile()
 	defer exileLock.Unlock()
 	_ = handle.file.Close()
 	handle.file = nil
@@ -1164,6 +1158,9 @@ func (fs *fileSystem) Rename(
 	if handle.file == nil {
 		return windows.STATUS_INVALID_HANDLE
 	}
+	exileLock := fs.locker.WLockExile()
+	defer exileLock.Unlock()
+
 	oldLock := handle.node.TryWLockPath()
 	if oldLock == nil {
 		return windows.STATUS_SHARING_VIOLATION
@@ -1246,7 +1243,14 @@ func (fs *fileSystem) Rename(
 	if err := fs.inner.Rename(source, target); err != nil {
 		return err
 	}
+
+	// oldLock.node -> source, newLock.node -> target
 	treelock.Exchange(oldLock, newLock)
+	// oldLock.node -> target, newLock.node -> source
+	// exileLock.node -> <exile>
+	treelock.Exchange(newLock, exileLock)
+	// newLock.node -> <exile>, exileLock.node -> source
+
 	return nil
 }
 
