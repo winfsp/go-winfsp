@@ -968,3 +968,14 @@ func Join(pl *PathLock, nl *NodeLock) *PathLock {
 	success = true
 	return joinedLock
 }
+
+func (tl *TreeLocker) WLockExile() *PathLock {
+	tl.mtx.Lock()
+	defer tl.mtx.Unlock()
+	exile := tl.allocRetainExile()
+	defer exile.free()
+	if !exile.tryWLockPath() {
+		panic("write lock exile failed")
+	}
+	return exile.createPathLock(tl, true)
+}
