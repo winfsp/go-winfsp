@@ -1,6 +1,7 @@
 package winfsp
 
 import (
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -175,6 +176,25 @@ type dllProc struct {
 var ntStatusPtrTarget windows.NTStatus
 var ntStatusPtr = uintptr(unsafe.Pointer(&ntStatusPtrTarget))
 
+// EnsureInitialized ensure this dllProc to be initialized.
+func (p dllProc) EnsureInitialized() {
+	if err := tryLoadWinFSP(); err != nil {
+		panic(fmt.Sprintf(`
+WinFSP DLL load failed: %v
+
+If you don't want to panic, you should consider calling
+LoadWinFSP or LoadWinFSPWithDLL manually and handle the
+load error there.
+`, err))
+	}
+	// This is actually an assertion error, since it
+	// must have been registered by registerProc, then
+	// tryLoadWinFSP will load it.
+	if p.proc == nil {
+		panic("dllProc not registered for initialization")
+	}
+}
+
 // Call is like syscall.Proc.Call but instead of always returning a non-nil error interface
 // value (even on success), this Call wrapper returns a nil error on success. It also
 // only returns one non-error result parameter, instead of two, as no callers require
@@ -187,6 +207,7 @@ var ntStatusPtr = uintptr(unsafe.Pointer(&ntStatusPtrTarget))
 // When the error is non-nil, it's always of type syscall.Errno, like
 // syscall.Proc.Call.
 func (p dllProc) Call(args ...uintptr) (uintptr, error) {
+	p.EnsureInitialized()
 	var ntStatus windows.NTStatus
 	statusIdx := slices.Index(args, ntStatusPtr)
 	if statusIdx != -1 {
@@ -228,21 +249,20 @@ func findProc(name string, target *dllProc) error {
 	return nil
 }
 
-func loadProcs(procs map[string]*dllProc) error {
-	for name, proc := range procs {
-		if err := findProc(name, proc); err != nil {
-			return err
-		}
-	}
-	return nil
+type dllProcRegistryItem struct {
+	name   string
+	target *dllProc
 }
 
-var dllProcRegistry = make(map[string]*dllProc)
+var dllProcRegistry []dllProcRegistryItem
 
 // registerProc registers a dllProc to be resolved
 // upon loading winFSPDLL.
 func registerProc(name string, target *dllProc) {
-	dllProcRegistry[name] = target
+	dllProcRegistry = append(dllProcRegistry, dllProcRegistryItem{
+		name:   name,
+		target: target,
+	})
 }
 
 func initWinFSP() error {
@@ -251,7 +271,12 @@ func initWinFSP() error {
 		return err
 	}
 	winFSPDLL = dll
-	return loadProcs(dllProcRegistry)
+	for _, item := range dllProcRegistry {
+		if err := findProc(item.name, item.target); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 var (

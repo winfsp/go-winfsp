@@ -1252,32 +1252,11 @@ var go_delegateCreateEx = syscall.NewCallbackCDecl(func(
 })
 
 var (
-	posixMapSecurityDescriptorToPermissions dllProc
-	posixMapSidToUid                        dllProc
-	posixMapUidToSid                        dllProc
-	setSecurityDescriptor                   dllProc
-	deleteSecurityDescriptor                dllProc
-	fileSystemOperationProcessId            dllProc
-	fileSystemResolveReparsePoints          dllProc
-	fileSystemFindReparsePoint              dllProc
-	debugLogSetHandle                       dllProc
-	fileSystemSetDebugLogF                  dllProc
+	fileSystemResolveReparsePoints dllProc
 )
 
 func init() {
-	registerProc(
-		"FspPosixMapSecurityDescriptorToPermissions",
-		&posixMapSecurityDescriptorToPermissions,
-	)
-	registerProc("FspPosixMapSidToUid", &posixMapSidToUid)
-	registerProc("FspPosixMapUidToSid", &posixMapUidToSid)
-	registerProc("FspSetSecurityDescriptor", &setSecurityDescriptor)
-	registerProc("FspDeleteSecurityDescriptor", &deleteSecurityDescriptor)
-	registerProc("FspFileSystemOperationProcessIdF", &fileSystemOperationProcessId)
 	registerProc("FspFileSystemResolveReparsePoints", &fileSystemResolveReparsePoints)
-	registerProc("FspFileSystemFindReparsePoint", &fileSystemFindReparsePoint)
-	registerProc("FspDebugLogSetHandle", &debugLogSetHandle)
-	registerProc("FspFileSystemSetDebugLogF", &fileSystemSetDebugLogF)
 }
 
 // BehaviourDeleteReparsePoint deletes a reparse point.
@@ -1461,134 +1440,6 @@ var go_delegateSetReparsePoint = syscall.NewCallbackCDecl(func(
 		buffer, size,
 	))
 })
-
-// PosixMapSecurityDescriptorToPermissions maps a Windows security descriptor to POSIX permissions.
-func PosixMapSecurityDescriptorToPermissions(securityDescriptor *windows.SECURITY_DESCRIPTOR) (uid, gid, mode uint32, err error) {
-	err = posixMapSecurityDescriptorToPermissions.CallStatus(
-		uintptr(unsafe.Pointer(securityDescriptor)),
-		uintptr(unsafe.Pointer(&uid)),
-		uintptr(unsafe.Pointer(&gid)),
-		uintptr(unsafe.Pointer(&mode)),
-	)
-
-	if err != nil {
-		return 0, 0, 0, errors.Wrap(err, "FspPosixMapSecurityDescriptorToPermissions")
-	}
-
-	return uid, gid, mode, nil
-}
-
-// PosixMapSidToUid maps a Windows SID to a POSIX UID.
-func PosixMapSidToUid(sid *windows.SID) (uint32, error) {
-	var uid uint32
-	err := posixMapSidToUid.CallStatus(
-		uintptr(unsafe.Pointer(sid)),
-		uintptr(unsafe.Pointer(&uid)),
-	)
-	if err != nil {
-		return 0, errors.Wrap(err, "FspPosixMapSidToUid")
-	}
-	return uid, nil
-}
-
-// PosixMapUidToSid maps a POSIX UID to a Windows SID.
-func PosixMapUidToSid(uid uint32) (*windows.SID, error) {
-	var sid *windows.SID
-	err := posixMapUidToSid.CallStatus(
-		uintptr(uid),
-		uintptr(unsafe.Pointer(&sid)),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "FspPosixMapUidToSid")
-	}
-	return sid, nil
-}
-
-// SetSecurityDescriptor modifies a security descriptor.
-//
-// This is a helper for implementing the SetSecurity operation.
-// It modifies an input security descriptor based on the provided
-// security information and modification descriptor.
-//
-// The windows.SECURITY_DESCRIPTOR returned by this function must be
-// manually freed by invoking DeleteSecurityDescriptor.
-func SetSecurityDescriptor(
-	inputDescriptor *windows.SECURITY_DESCRIPTOR,
-	securityInformation windows.SECURITY_INFORMATION,
-	modificationDescriptor *windows.SECURITY_DESCRIPTOR,
-) (*windows.SECURITY_DESCRIPTOR, error) {
-	var outputDescriptor *windows.SECURITY_DESCRIPTOR
-	err := setSecurityDescriptor.CallStatus(
-		uintptr(unsafe.Pointer(inputDescriptor)),
-		uintptr(securityInformation),
-		uintptr(unsafe.Pointer(modificationDescriptor)),
-		uintptr(unsafe.Pointer(&outputDescriptor)),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "FspSetSecurityDescriptor")
-	}
-	return outputDescriptor, nil
-}
-
-// DeleteSecurityDescriptor deletes a security descriptor.
-//
-// This is a helper for cleaning up security descriptors created
-// by SetSecurityDescriptor.
-func DeleteSecurityDescriptor(securityDescriptor *windows.SECURITY_DESCRIPTOR) error {
-	// Pass a function pointer to indicate this was created by FspSetSecurityDescriptor
-	// The C API expects this to match the function that created the descriptor
-	_, err := deleteSecurityDescriptor.Call(
-		uintptr(unsafe.Pointer(securityDescriptor)),
-		uintptr(unsafe.Pointer(setSecurityDescriptor.proc)),
-	)
-
-	return err
-}
-
-// DebugLogSetHandle sets the debug log handle for WinFSP debugging output.
-//
-// This function sets the handle where debug messages will be written when debug
-// logging is enabled. The handle should be a valid Windows file handle.
-func DebugLogSetHandle(handle syscall.Handle) error {
-	if err := tryLoadWinFSP(); err != nil {
-		return err
-	}
-	_, err := debugLogSetHandle.Call(uintptr(handle))
-	return err
-}
-
-// FileSystemOperationProcessId gets the originating process ID.
-//
-// Valid only during Create, Open and Rename requests when the target exists.
-// This function can only be called from within a file system operation handler.
-func FileSystemOperationProcessId() uint32 {
-	result, _ := fileSystemOperationProcessId.Call()
-	return uint32(result)
-}
-
-func FileSystemFindReparsePoint(
-	fileSystem *FileSystemRef, fileName string,
-) (bool, uint32, error) {
-	utf16FileName, err := windows.UTF16PtrFromString(fileName)
-	if err != nil {
-		return false, 0, errors.Wrap(err, "convert filename to UTF16")
-	}
-
-	var reparsePointIndex uint32
-
-	result, err := fileSystemFindReparsePoint.Call(
-		uintptr(unsafe.Pointer(fileSystem.fileSystem)), // FileSystem
-		go_delegateGetReparsePointByName,               // GetReparsePointByName callback
-		uintptr(0),                                     // Context (unused)
-		uintptr(unsafe.Pointer(utf16FileName)),         // FileName
-		uintptr(unsafe.Pointer(&reparsePointIndex)),    // PReparsePointIndex
-	)
-
-	if err != nil {
-		return false, 0, errors.Wrap(err, "FspFileSystemFindReparsePoint")
-	}
-	return byte(result) != 0, reparsePointIndex, nil
-}
 
 const (
 	dirInfoAlignment uint16 = uint16(unsafe.Alignof(FSP_FSCTL_DIR_INFO{}))
@@ -1779,6 +1630,7 @@ var (
 	setMountPoint    dllProc
 	startDispatcher  dllProc
 	stopDispatcher   dllProc
+	setDebugLogF     dllProc
 )
 
 func init() {
@@ -1787,6 +1639,7 @@ func init() {
 	registerProc("FspFileSystemSetMountPoint", &setMountPoint)
 	registerProc("FspFileSystemStartDispatcher", &startDispatcher)
 	registerProc("FspFileSystemStopDispatcher", &stopDispatcher)
+	registerProc("FspFileSystemSetDebugLogF", &setDebugLogF)
 }
 
 // Mount attempts to mount a file system to specified mount
@@ -2013,7 +1866,7 @@ func Mount(
 
 	if option.debug {
 		// Set debug log level to maximum for debug output
-		_, err = fileSystemSetDebugLogF.Call(
+		_, err = setDebugLogF.Call(
 			uintptr(unsafe.Pointer(result.fileSystem)),
 			uintptr(math.MaxUint32),
 		)
