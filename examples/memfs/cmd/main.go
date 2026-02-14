@@ -25,7 +25,6 @@ var rootCmd = &cobra.Command{
 		// Create and mount the filesystem.
 		ptfs, err := winfsp.Mount(
 			gofs.New(memfs.New()), mountpoint,
-			winfsp.CaseSensitive(true),
 		)
 		if err != nil {
 			return errors.Wrap(err, "mount filesystem")

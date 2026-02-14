@@ -1759,6 +1759,15 @@ var (
 	stopDispatcher   dllProc
 )
 
+// BehaviourDefaultOptions specifies that the provided
+// filesystem has some default set of mount options.
+//
+// The user might still override the options provided
+// by the filesystem, at their own risks.
+type BehaviourDefaultOptions interface {
+	DefaultOptions() []Option
+}
+
 // Mount attempts to mount a file system to specified mount
 // point, returning the handle to the real filesystem.
 func Mount(
@@ -1771,6 +1780,9 @@ func Mount(
 		return nil, err
 	}
 	option := newOption()
+	if inner, ok := fs.(BehaviourDefaultOptions); ok {
+		Options(inner.DefaultOptions()...)(option)
+	}
 	Options(opts...)(option)
 	created := false
 
@@ -1790,6 +1802,7 @@ func Mount(
 	attributes := option.attributes
 	if option.caseSensitive {
 		attributes |= FspFSAttributeCaseSensitive
+		attributes |= FspFSAttributeCasePreservedNames
 	}
 	attributes |= FspFSAttributeUnicodeOnDisk
 	attributes |= FspFSAttributePersistentAcls
