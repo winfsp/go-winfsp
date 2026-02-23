@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 
@@ -79,6 +80,7 @@ type memStat struct {
 	mode       os.FileMode
 	modifyTime time.Time
 	size       int64
+	fileID     uint64
 }
 
 func (s memStat) IsDir() bool        { return s.mode.IsDir() }
@@ -90,6 +92,10 @@ func (memStat) Sys() any             { return nil }
 
 var _ os.FileInfo = memStat{}
 
+func (s memStat) FileID() uint64 { return s.fileID }
+
+var _ gofs.FileInfoFileID = memStat{}
+
 func (item *memItem) stat() os.FileInfo {
 	item.metaMtx.Lock()
 	defer item.metaMtx.Unlock()
@@ -98,6 +104,7 @@ func (item *memItem) stat() os.FileInfo {
 		mode:       item.mode,
 		modifyTime: item.modifyTime,
 		size:       item.obj.size(),
+		fileID:     uint64(uintptr(unsafe.Pointer(item))),
 	}
 }
 
@@ -589,5 +596,6 @@ func (m *MemFS) DefaultOptions() []gofs.NewOption {
 	if m.caseInsensitive {
 		result = append(result, gofs.WithCaseInsensitive(true))
 	}
+	result = append(result, gofs.WithProvideFileID(true))
 	return result
 }

@@ -48,8 +48,8 @@ func init() {
 		&mountpoint, "mount", "m", mountpoint,
 		"Where to mount the directory",
 	)
-	rootCmd.PersistentFlags().BoolVar(
-		&caseInsensitive, "case-insensitive", caseInsensitive,
+	rootCmd.PersistentFlags().BoolVarP(
+		&caseInsensitive, "case-insensitive", "i", caseInsensitive,
 		"Whether the filesystem is case insensitive",
 	)
 }

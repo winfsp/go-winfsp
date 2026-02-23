@@ -42,6 +42,27 @@ type FileSystem interface {
 	Remove(name string) error
 }
 
+// FileInfoFileID means the provided os.FileInfo
+// is able to provide File ID. Will be ignored
+// unless the option
+// `gofs.WithProvideFileID(true)` is set.
+//
+// If the implementor filesystem is able to
+// assign a fixed ID to each file **on disk**,
+// providing this interface will enable the
+// application to identify the file nodes by
+// their file IDs correctly.
+//
+// If the provided os.FileInfo does not implement
+// FileInfoFileID, then the File ID will be a temporary
+// ID generated from the treelocking system, which will
+// be stable as long as there's open file.
+type FileInfoFileID interface {
+	os.FileInfo
+
+	FileID() uint64
+}
+
 type fileHandle struct {
 	node  *treelock.Node
 	dir   winfsp.DirBuffer
@@ -154,6 +175,7 @@ type fileSystem struct {
 
 	readOnlyTransMode    AttribReadOnlyTransMode
 	caseInsensitive      bool
+	providesFileID       bool
 	defaultWinfspOptions []winfsp.Option
 }
 
@@ -348,7 +370,13 @@ func (fs *fileSystem) GetSecurityByName(
 		return 0, nil, err
 	}
 	target := &winfsp.FSP_FSCTL_FILE_INFO{}
-	err = fs.fillInfoFromPathLocked(target, name, info, nil, 0)
+	var fileID uint64
+	if fs.providesFileID {
+		if v, ok := info.(FileInfoFileID); ok {
+			fileID = v.FileID()
+		}
+	}
+	err = fs.fillInfoFromPathLocked(target, name, info, nil, fileID)
 	if err != nil || flags == winfsp.GetAttributesByName {
 		return 0, nil, err
 	}
@@ -581,6 +609,11 @@ func (fs *fileSystem) openFile(
 
 	// Evaluate the file index for the file and cache it.
 	handle.evaluatedIndex = lock.AddrAsID()
+	if fs.providesFileID {
+		if v, ok := fileInfo.(FileInfoFileID); ok {
+			handle.evaluatedIndex = v.FileID()
+		}
+	}
 
 	// Copy the status out to the file information block.
 	//
@@ -751,7 +784,13 @@ func (fs *fileSystem) ReadDirectory(
 	}
 	for _, fileInfo := range fileInfos {
 		var info winfsp.FSP_FSCTL_FILE_INFO
-		fs.fillInfoFromSelfParentStats(&info, fileInfo, parentInfo, 0)
+		var fileID uint64
+		if fs.providesFileID {
+			if v, ok := fileInfo.(FileInfoFileID); ok {
+				fileID = v.FileID()
+			}
+		}
+		fs.fillInfoFromSelfParentStats(&info, fileInfo, parentInfo, fileID)
 		ok, err := fill(fileInfo.Name(), &info)
 		if err != nil || !ok {
 			return err
@@ -1286,6 +1325,7 @@ var _ winfsp.BehaviourRename = (*fileSystem)(nil)
 type newOption struct {
 	attribReadOnlyTransMode AttribReadOnlyTransMode
 	caseInsensitive         bool
+	providesFileID          bool
 	defaultWinfspOptions    []winfsp.Option
 }
 
@@ -1326,6 +1366,13 @@ func WithAttribReadOnlyTransMode(mode AttribReadOnlyTransMode) NewOption {
 	}
 }
 
+func WithProvideFileID(v bool) NewOption {
+	return func(option *newOption) error {
+		option.providesFileID = v
+		return nil
+	}
+}
+
 func WithDefaultWinfspOptions(opts ...winfsp.Option) NewOption {
 	return func(option *newOption) error {
 		option.defaultWinfspOptions = append(option.defaultWinfspOptions, opts...)
@@ -1337,8 +1384,8 @@ func (fs *fileSystem) DefaultOptions() []winfsp.Option {
 	var result []winfsp.Option
 	if !fs.caseInsensitive {
 		result = append(result, winfsp.CaseSensitive(true))
-		result = append(result, winfsp.CasePreserveNames(true))
 	}
+	result = append(result, winfsp.CasePreserveNames(true))
 	result = append(result, fs.defaultWinfspOptions...)
 	return result
 }
@@ -1389,6 +1436,7 @@ func NewOptions(
 		locker:               treelock.New(),
 		readOnlyTransMode:    option.attribReadOnlyTransMode,
 		caseInsensitive:      option.caseInsensitive,
+		providesFileID:       option.providesFileID,
 		defaultWinfspOptions: option.defaultWinfspOptions,
 	}, nil
 }
