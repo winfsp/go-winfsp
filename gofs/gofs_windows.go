@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -39,6 +40,27 @@ type FileSystem interface {
 	Stat(name string) (os.FileInfo, error)
 	Rename(source, target string) error
 	Remove(name string) error
+}
+
+// FileInfoFileID means the provided os.FileInfo
+// is able to provide File ID. Will be ignored
+// unless the option
+// `gofs.WithProvideFileID(true)` is set.
+//
+// If the implementor filesystem is able to
+// assign a fixed ID to each file **on disk**,
+// providing this interface will enable the
+// application to identify the file nodes by
+// their file IDs correctly.
+//
+// If the provided os.FileInfo does not implement
+// FileInfoFileID, then the File ID will be a temporary
+// ID generated from the treelocking system, which will
+// be stable as long as there's open file.
+type FileInfoFileID interface {
+	os.FileInfo
+
+	FileID() uint64
 }
 
 type fileHandle struct {
@@ -151,7 +173,18 @@ type fileSystem struct {
 	labelLen int
 	label    [32]uint16
 
-	readOnlyTransMode AttribReadOnlyTransMode
+	readOnlyTransMode    AttribReadOnlyTransMode
+	caseInsensitive      bool
+	providesFileID       bool
+	defaultWinfspOptions []winfsp.Option
+}
+
+func (fs *fileSystem) filterNameForLock(name string) string {
+	name = treelock.UnifyFilePath(name)
+	if fs.caseInsensitive {
+		name = strings.ToUpper(name)
+	}
+	return name
 }
 
 func (fs *fileSystem) readOnlyBitFromSelfParentStats(
@@ -329,15 +362,21 @@ func (fs *fileSystem) GetSecurityByName(
 	flags winfsp.GetSecurityByNameFlags,
 ) (uint32, *windows.SECURITY_DESCRIPTOR, error) {
 	var err error
-	plock := fs.locker.RLockFile(name)
+	name = treelock.UnifyFilePath(name)
+	plock := fs.locker.RLockFile(fs.filterNameForLock(name))
 	defer plock.Unlock()
-	name = plock.FilePath()
 	info, err := fs.inner.Stat(name)
 	if err != nil || flags == winfsp.GetExistenceOnly {
 		return 0, nil, err
 	}
 	target := &winfsp.FSP_FSCTL_FILE_INFO{}
-	err = fs.fillInfoFromPathLocked(target, name, info, nil, 0)
+	var fileID uint64
+	if fs.providesFileID {
+		if v, ok := info.(FileInfoFileID); ok {
+			fileID = v.FileID()
+		}
+	}
+	err = fs.fillInfoFromPathLocked(target, name, info, nil, fileID)
 	if err != nil || flags == winfsp.GetAttributesByName {
 		return 0, nil, err
 	}
@@ -431,6 +470,9 @@ func (fs *fileSystem) openFile(
 		return 0, windows.STATUS_INVALID_PARAMETER
 	}
 
+	// Normalize the path to ensure identity of operation.
+	name = treelock.UnifyFilePath(name)
+
 	// Lock the file with desired mode.
 
 	// We are allowed to wait for the write operation
@@ -442,7 +484,7 @@ func (fs *fileSystem) openFile(
 		(disposition == windows.FILE_SUPERSEDE) {
 		lockFunc = fs.locker.TryWLockFile
 	}
-	lock := lockFunc(name)
+	lock := lockFunc(fs.filterNameForLock(name))
 	if lock == nil {
 		return 0, windows.STATUS_SHARING_VIOLATION
 	}
@@ -481,9 +523,6 @@ func (fs *fileSystem) openFile(
 			fs.handles.Delete(handleAddr)
 		}
 	}()
-
-	// Normalize the path to ensure identity of operation.
-	name = lock.FilePath()
 
 	// See if we are asked to create directories here.
 	if (createOptions&windows.FILE_DIRECTORY_FILE != 0) &&
@@ -570,6 +609,11 @@ func (fs *fileSystem) openFile(
 
 	// Evaluate the file index for the file and cache it.
 	handle.evaluatedIndex = lock.AddrAsID()
+	if fs.providesFileID {
+		if v, ok := fileInfo.(FileInfoFileID); ok {
+			handle.evaluatedIndex = v.FileID()
+		}
+	}
 
 	// Copy the status out to the file information block.
 	//
@@ -740,7 +784,13 @@ func (fs *fileSystem) ReadDirectory(
 	}
 	for _, fileInfo := range fileInfos {
 		var info winfsp.FSP_FSCTL_FILE_INFO
-		fs.fillInfoFromSelfParentStats(&info, fileInfo, parentInfo, 0)
+		var fileID uint64
+		if fs.providesFileID {
+			if v, ok := fileInfo.(FileInfoFileID); ok {
+				fileID = v.FileID()
+			}
+		}
+		fs.fillInfoFromSelfParentStats(&info, fileInfo, parentInfo, fileID)
 		ok, err := fill(fileInfo.Name(), &info)
 		if err != nil || !ok {
 			return err
@@ -1147,7 +1197,7 @@ var _ winfsp.BehaviourCleanup = (*fileSystem)(nil)
 
 func (fs *fileSystem) Rename(
 	ref *winfsp.FileSystemRef, file uintptr,
-	source, target string, replaceIfExist bool,
+	_, target string, replaceIfExist bool,
 ) error {
 	handle, err := fs.load(file)
 	if err != nil {
@@ -1170,19 +1220,35 @@ func (fs *fileSystem) Rename(
 		return windows.STATUS_OBJECT_NAME_NOT_FOUND
 	}
 
-	// Try to grab the target path's lock.
-	newLock := fs.locker.TryWLockFile(target)
-	if newLock == nil {
-		return windows.STATUS_SHARING_VIOLATION
-	}
-	defer newLock.Unlock()
+	// Normalize the source and target name.
+	source := oldLock.FilePath()
+	sourceFiltered := fs.filterNameForLock(source)
 
 	// Normalize the target name.
-	target = newLock.FilePath()
+	target = treelock.UnifyFilePath(target)
+	targetFiltered := fs.filterNameForLock(target)
+
+	// Try to grab the target path's lock.
+	//
+	// XXX: If the filtered source name is the same as
+	// the filtered target name, they will be thought
+	// to be the same. Holding old lock suffices.
+	var newLock *treelock.PathLock
+	if sourceFiltered != targetFiltered {
+		newLock = fs.locker.TryWLockFile(targetFiltered)
+		if newLock == nil {
+			return windows.STATUS_SHARING_VIOLATION
+		}
+		defer newLock.Unlock()
+	}
 
 	// Check for the rename precondition so that we could
 	// avoid performing sophiscated operations.
-	if !replaceIfExist {
+	//
+	// If the target name is the same as the source name
+	// after being filtered, they will be thought as the
+	// same file and thus no "replace" semantic.
+	if newLock != nil && !replaceIfExist {
 		fileInfo, err := fs.inner.Stat(target)
 		if err != nil && !os.IsNotExist(err) &&
 			!errors.Is(err, windows.STATUS_OBJECT_NAME_NOT_FOUND) {
@@ -1239,18 +1305,18 @@ func (fs *fileSystem) Rename(
 	}()
 
 	// Attempt to perform the rename operation now.
-	source = oldLock.FilePath()
 	if err := fs.inner.Rename(source, target); err != nil {
 		return err
 	}
 
-	// oldLock.node -> source, newLock.node -> target
-	treelock.Exchange(oldLock, newLock)
-	// oldLock.node -> target, newLock.node -> source
-	// exileLock.node -> <exile>
-	treelock.Exchange(newLock, exileLock)
-	// newLock.node -> <exile>, exileLock.node -> source
-
+	if newLock != nil {
+		// oldLock.node -> source, newLock.node -> target
+		treelock.Exchange(oldLock, newLock)
+		// oldLock.node -> target, newLock.node -> source
+		// exileLock.node -> <exile>
+		treelock.Exchange(newLock, exileLock)
+		// newLock.node -> <exile>, exileLock.node -> source
+	}
 	return nil
 }
 
@@ -1258,11 +1324,21 @@ var _ winfsp.BehaviourRename = (*fileSystem)(nil)
 
 type newOption struct {
 	attribReadOnlyTransMode AttribReadOnlyTransMode
+	caseInsensitive         bool
+	providesFileID          bool
+	defaultWinfspOptions    []winfsp.Option
 }
 
 // NewOption is the optional option used to
 // initialize the gofs.
 type NewOption func(*newOption) error
+
+func WithCaseInsensitive(v bool) NewOption {
+	return func(option *newOption) error {
+		option.caseInsensitive = v
+		return nil
+	}
+}
 
 func WithAttribReadOnlyTransMode(mode AttribReadOnlyTransMode) NewOption {
 	return func(option *newOption) (rerr error) {
@@ -1290,6 +1366,55 @@ func WithAttribReadOnlyTransMode(mode AttribReadOnlyTransMode) NewOption {
 	}
 }
 
+func WithProvideFileID(v bool) NewOption {
+	return func(option *newOption) error {
+		option.providesFileID = v
+		return nil
+	}
+}
+
+func WithDefaultWinfspOptions(opts ...winfsp.Option) NewOption {
+	return func(option *newOption) error {
+		option.defaultWinfspOptions = append(option.defaultWinfspOptions, opts...)
+		return nil
+	}
+}
+
+func (fs *fileSystem) DefaultOptions() []winfsp.Option {
+	var result []winfsp.Option
+	if !fs.caseInsensitive {
+		result = append(result, winfsp.CaseSensitive(true))
+	}
+	result = append(result, winfsp.CasePreserveNames(true))
+	result = append(result, fs.defaultWinfspOptions...)
+	return result
+}
+
+var _ winfsp.BehaviourDefaultOptions = (*fileSystem)(nil)
+
+func WithOptions(opts ...NewOption) NewOption {
+	return func(option *newOption) error {
+		for _, opt := range opts {
+			if err := opt(option); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// FileSystemDefaultOptions allows the implementors of
+// FileSystem to specify a set of default gofs.NewOption
+// with respect to their own state.
+//
+// The caller can still override the options, but at
+// their own risks.
+type FileSystemDefaultOptions interface {
+	FileSystem
+
+	DefaultOptions() []NewOption
+}
+
 // NewOptions create the file system with
 // the provided `gofs.FileSystem` and a
 // variadic array of options.
@@ -1297,15 +1422,22 @@ func NewOptions(
 	fs FileSystem, opts ...NewOption,
 ) (winfsp.BehaviourBase, error) {
 	var option newOption
-	for _, opt := range opts {
+	if inner, ok := fs.(FileSystemDefaultOptions); ok {
+		opt := WithOptions(inner.DefaultOptions()...)
 		if err := opt(&option); err != nil {
 			return nil, err
 		}
 	}
+	if err := WithOptions(opts...)(&option); err != nil {
+		return nil, err
+	}
 	return &fileSystem{
-		inner:             fs,
-		locker:            treelock.New(),
-		readOnlyTransMode: option.attribReadOnlyTransMode,
+		inner:                fs,
+		locker:               treelock.New(),
+		readOnlyTransMode:    option.attribReadOnlyTransMode,
+		caseInsensitive:      option.caseInsensitive,
+		providesFileID:       option.providesFileID,
+		defaultWinfspOptions: option.defaultWinfspOptions,
 	}, nil
 }
 

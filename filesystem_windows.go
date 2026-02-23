@@ -1566,6 +1566,16 @@ func Options(opts ...Option) Option {
 	}
 }
 
+// BehaviourDefaultOptions allows the implementors
+// of BehaviourBase to specify a set of default
+// winfsp.Options with respect to their own state.
+//
+// The user may still override the options, but
+// at their own risks.
+type BehaviourDefaultOptions interface {
+	DefaultOptions() []Option
+}
+
 const (
 	fspNetDeviceName  = "WinFSP.Net"
 	fspDiskDeviceName = "WinFSP.Disk"
@@ -1601,6 +1611,9 @@ func Mount(
 		return nil, err
 	}
 	option := newOption()
+	if inner, ok := fs.(BehaviourDefaultOptions); ok {
+		Options(inner.DefaultOptions()...)(option)
+	}
 	Options(opts...)(option)
 	created := false
 

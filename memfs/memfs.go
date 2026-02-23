@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 
@@ -78,6 +80,7 @@ type memStat struct {
 	mode       os.FileMode
 	modifyTime time.Time
 	size       int64
+	fileID     uint64
 }
 
 func (s memStat) IsDir() bool        { return s.mode.IsDir() }
@@ -89,6 +92,10 @@ func (memStat) Sys() any             { return nil }
 
 var _ os.FileInfo = memStat{}
 
+func (s memStat) FileID() uint64 { return s.fileID }
+
+var _ gofs.FileInfoFileID = memStat{}
+
 func (item *memItem) stat() os.FileInfo {
 	item.metaMtx.Lock()
 	defer item.metaMtx.Unlock()
@@ -97,6 +104,7 @@ func (item *memItem) stat() os.FileInfo {
 		mode:       item.mode,
 		modifyTime: item.modifyTime,
 		size:       item.obj.size(),
+		fileID:     uint64(uintptr(unsafe.Pointer(item))),
 	}
 }
 
@@ -104,9 +112,34 @@ type MemFS struct {
 	mtx      sync.Mutex
 	rootItem *memItem
 	rootDir  *memDir
+
+	caseInsensitive bool
 }
 
-func New() *MemFS {
+func (m *MemFS) keyForName(name string) string {
+	if m.caseInsensitive {
+		name = strings.ToUpper(name)
+	}
+	return name
+}
+
+type newOption struct {
+	caseInsensitive bool
+}
+
+type NewOption func(*newOption)
+
+func WithCaseInsensitive(v bool) NewOption {
+	return func(option *newOption) {
+		option.caseInsensitive = v
+	}
+}
+
+func New(opts ...NewOption) *MemFS {
+	var option newOption
+	for _, opt := range opts {
+		opt(&option)
+	}
 	rootDir := &memDir{
 		dentries: make(map[string]*memItem),
 	}
@@ -115,8 +148,9 @@ func New() *MemFS {
 		"\\", rootDir,
 	)
 	result := &MemFS{
-		rootItem: rootItem,
-		rootDir:  rootDir,
+		rootItem:        rootItem,
+		rootDir:         rootDir,
+		caseInsensitive: option.caseInsensitive,
 	}
 	return result
 }
@@ -284,14 +318,14 @@ func (m *memOpenDir) Readdir(count int) ([]os.FileInfo, error) {
 	m.snapOnce.Do(func() {
 		m.fs.mtx.Lock()
 		defer m.fs.mtx.Unlock()
-		var names []string
-		for name := range m.dir.dentries {
-			names = append(names, name)
+		var keys []string
+		for key := range m.dir.dentries {
+			keys = append(keys, key)
 		}
-		sort.Strings(names)
+		sort.Strings(keys)
 		var snapshot []os.FileInfo
-		for _, name := range names {
-			stat := m.dir.dentries[name].stat()
+		for _, key := range keys {
+			stat := m.dir.dentries[key].stat()
 			snapshot = append(snapshot, stat)
 		}
 		m.snapshot = snapshot
@@ -334,7 +368,8 @@ func (fs *MemFS) findDirLocked(path string) (*memItem, *memDir, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	item, ok := parentDir.dentries[base]
+	key := fs.keyForName(base)
+	item, ok := parentDir.dentries[key]
 	if !ok {
 		return nil, nil, os.ErrNotExist
 	}
@@ -363,9 +398,10 @@ func (m *MemFS) OpenFile(name string, flag int, perm os.FileMode) (gofs.File, er
 	if err != nil {
 		return nil, err
 	}
+	key := m.keyForName(base)
 
 	var result gofs.File
-	if item, ok := dir.dentries[base]; ok {
+	if item, ok := dir.dentries[key]; ok {
 		switch t := item.obj.(type) {
 		case *memFile:
 			result = &memOpenFile{
@@ -392,7 +428,7 @@ func (m *MemFS) OpenFile(name string, flag int, perm os.FileMode) (gofs.File, er
 	if flag&os.O_CREATE != 0 && result == nil {
 		file := &memFile{}
 		item := newMemItem(perm.Perm(), base, file)
-		dir.dentries[base] = item
+		dir.dentries[key] = item
 		result = &memOpenFile{
 			item: item,
 			flag: flag,
@@ -426,11 +462,12 @@ func (m *MemFS) Mkdir(name string, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if _, ok := dir.dentries[base]; ok {
+	key := m.keyForName(base)
+	if _, ok := dir.dentries[key]; ok {
 		return os.ErrExist
 	}
 
-	dir.dentries[base] = newMemItem(
+	dir.dentries[key] = newMemItem(
 		perm.Perm()|fs.ModeDir,
 		base,
 		&memDir{
@@ -456,7 +493,8 @@ func (m *MemFS) Remove(name string) error {
 	if err != nil {
 		return err
 	}
-	item, ok := dir.dentries[base]
+	key := m.keyForName(base)
+	item, ok := dir.dentries[key]
 	if !ok {
 		return os.ErrNotExist
 	}
@@ -471,7 +509,7 @@ func (m *MemFS) Remove(name string) error {
 		return windows.STATUS_ACCESS_DENIED
 	}
 
-	delete(dir.dentries, base)
+	delete(dir.dentries, key)
 	dirItem.touch()
 	return nil
 }
@@ -493,7 +531,8 @@ func (m *MemFS) Rename(src string, tgt string) error {
 	if err != nil {
 		return err
 	}
-	item, ok := srcDir.dentries[srcBase]
+	srcKey := m.keyForName(srcBase)
+	item, ok := srcDir.dentries[srcKey]
 	if !ok {
 		return os.ErrNotExist
 	}
@@ -514,9 +553,10 @@ func (m *MemFS) Rename(src string, tgt string) error {
 	}
 
 	// Now it's safe to modify the file.
-	delete(srcDir.dentries, srcBase)
+	delete(srcDir.dentries, srcKey)
 	srcItem.touch()
-	tgtDir.dentries[tgtBase] = item
+	tgtKey := m.keyForName(tgtBase)
+	tgtDir.dentries[tgtKey] = item
 	tgtItem.touch()
 	func() {
 		item.metaMtx.Lock()
@@ -540,7 +580,8 @@ func (m *MemFS) Stat(name string) (os.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	item, ok := dir.dentries[base]
+	key := m.keyForName(base)
+	item, ok := dir.dentries[key]
 	if !ok {
 		return nil, os.ErrNotExist
 	}
@@ -549,3 +590,12 @@ func (m *MemFS) Stat(name string) (os.FileInfo, error) {
 }
 
 var _ gofs.FileSystem = (*MemFS)(nil)
+
+func (m *MemFS) DefaultOptions() []gofs.NewOption {
+	var result []gofs.NewOption
+	if m.caseInsensitive {
+		result = append(result, gofs.WithCaseInsensitive(true))
+	}
+	result = append(result, gofs.WithProvideFileID(true))
+	return result
+}

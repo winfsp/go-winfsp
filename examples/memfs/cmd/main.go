@@ -15,7 +15,8 @@ import (
 )
 
 var (
-	mountpoint string = "X:"
+	mountpoint      string = "X:"
+	caseInsensitive bool   = false
 )
 
 var rootCmd = &cobra.Command{
@@ -24,8 +25,10 @@ var rootCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Create and mount the filesystem.
 		ptfs, err := winfsp.Mount(
-			gofs.New(memfs.New()), mountpoint,
-			winfsp.CaseSensitive(true),
+			gofs.New(memfs.New(
+				memfs.WithCaseInsensitive(caseInsensitive),
+			)),
+			mountpoint,
 		)
 		if err != nil {
 			return errors.Wrap(err, "mount filesystem")
@@ -44,6 +47,10 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(
 		&mountpoint, "mount", "m", mountpoint,
 		"Where to mount the directory",
+	)
+	rootCmd.PersistentFlags().BoolVarP(
+		&caseInsensitive, "case-insensitive", "i", caseInsensitive,
+		"Whether the filesystem is case insensitive",
 	)
 }
 
