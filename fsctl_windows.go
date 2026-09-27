@@ -159,6 +159,7 @@ type FSP_FSCTL_OPEN_FILE_INFO struct {
 
 type FSP_FSCTL_DIR_INFO struct {
 	Size       uint16
+	_          [6]byte // FileInfo is 8-byte aligned in C, also on 386
 	FileInfo   FSP_FSCTL_FILE_INFO
 	NextOffset uint64
 	Padding0   uint64

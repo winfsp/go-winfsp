@@ -12,7 +12,7 @@ import (
 const ()
 
 const (
-	dirInfoAlignment uint16 = uint16(unsafe.Alignof(FSP_FSCTL_DIR_INFO{}))
+	dirInfoAlignment uint16 = 8        // FSP_FSCTL_DEFAULT_ALIGNMENT
 	replacementChar         = '\uFFFD' // Unicode replacement character
 )
 
