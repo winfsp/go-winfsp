@@ -366,20 +366,6 @@ func delegateCreate(
 	return windows.STATUS_SUCCESS
 }
 
-var go_delegateCreate = syscall.NewCallbackCDecl(func(
-	fileSystem, fileName uintptr,
-	createOptions, grantedAccess, fileAttributes uint32,
-	securityDescriptor uintptr, allocationSize uint64,
-	file *uintptr, fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateCreate(
-		fileSystem, fileName,
-		createOptions, grantedAccess, fileAttributes,
-		securityDescriptor, allocationSize,
-		file, fileInfoAddr,
-	))
-})
-
 // BehaviourOverwrite overwrites a file's attribute.
 type BehaviourOverwrite interface {
 	Overwrite(
@@ -405,18 +391,6 @@ func delegateOverwrite(
 			unsafe.Pointer(fileInfoAddr)),
 	))
 }
-
-var go_delegateOverwrite = syscall.NewCallbackCDecl(func(
-	fileSystem, file uintptr,
-	attributes uint32, replaceAttributes uint8,
-	allocationSize uint64, fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateOverwrite(
-		fileSystem, file,
-		attributes, replaceAttributes,
-		allocationSize, fileInfoAddr,
-	))
-})
 
 // BehaviourCleanup performs the cleanup behaviour.
 type BehaviourCleanup interface {
@@ -479,16 +453,6 @@ func delegateRead(
 	return convertNTStatus(err)
 }
 
-var go_delegateRead = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext, buffer uintptr,
-	offset uint64, length uint32, bytesRead *uint32,
-) uintptr {
-	return uintptr(delegateRead(
-		fileSystem, fileContext, buffer,
-		offset, length, bytesRead,
-	))
-})
-
 // BehaviourWrite writes an open file.
 type BehaviourWrite interface {
 	Write(
@@ -519,20 +483,6 @@ func delegateWrite(
 	*bytesWritten = uint32(n)
 	return convertNTStatus(err)
 }
-
-var go_delegateWrite = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext, buffer uintptr,
-	offset uint64, length uint32,
-	writeToEndOfFile, constrainedIo uint8,
-	bytesWritten *uint32, fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateWrite(
-		fileSystem, fileContext, buffer,
-		offset, length,
-		writeToEndOfFile, constrainedIo,
-		bytesWritten, fileInfoAddr,
-	))
-})
 
 // BehaviourFlush flushes a file or volume.
 //
@@ -650,19 +600,6 @@ func delegateSetBasicInfo(
 	))
 }
 
-var go_delegateSetBasicInfo = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext uintptr,
-	attributes uint32,
-	creationTime, lastAccessTime, lastWriteTime, changeTime uint64,
-	fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateSetBasicInfo(
-		fileSystem, fileContext, attributes,
-		creationTime, lastAccessTime, lastWriteTime, changeTime,
-		fileInfoAddr,
-	))
-})
-
 // BehaviourSetFileSize sets file's size or allocation size.
 type BehaviourSetFileSize interface {
 	SetFileSize(
@@ -686,18 +623,6 @@ func delegateSetFileSize(
 		(*FSP_FSCTL_FILE_INFO)(unsafe.Pointer(fileInfoAddr)),
 	))
 }
-
-var go_delegateSetFileSize = syscall.NewCallbackCDecl(func(
-	fileSystem, fileContext uintptr,
-	newSize uint64, setAllocationSize uint8,
-	fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateSetFileSize(
-		fileSystem, fileContext,
-		newSize, setAllocationSize,
-		fileInfoAddr,
-	))
-})
 
 // BehaviourCanDelete detects whether the file can be deleted.
 type BehaviourCanDelete interface {
@@ -1235,22 +1160,6 @@ func delegateCreateEx(
 	*file = result
 	return windows.STATUS_SUCCESS
 }
-
-var go_delegateCreateEx = syscall.NewCallbackCDecl(func(
-	fileSystem, fileName uintptr,
-	createOptions, grantedAccess, fileAttributes uint32,
-	securityDescriptor uintptr, allocationSize uint64,
-	extraBuffer uintptr, extraLength uint32, isReparse uint8,
-	file *uintptr, fileInfoAddr uintptr,
-) uintptr {
-	return uintptr(delegateCreateEx(
-		fileSystem, fileName,
-		createOptions, grantedAccess, fileAttributes,
-		securityDescriptor, allocationSize,
-		extraBuffer, extraLength, isReparse,
-		file, fileInfoAddr,
-	))
-})
 
 var (
 	fileSystemResolveReparsePoints dllProc
