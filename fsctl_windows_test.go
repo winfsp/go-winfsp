@@ -9,9 +9,7 @@ import (
 	"github.com/winfsp/go-winfsp"
 )
 
-// TestStructLayout checks the mirrored structs against the
-// layout asserted in winfsp/fsctl.h, which must hold on every
-// architecture, including 386.
+// TestStructLayout checks struct layouts against winfsp/fsctl.h.
 func TestStructLayout(t *testing.T) {
 	var (
 		fileInfo winfsp.FSP_FSCTL_FILE_INFO
