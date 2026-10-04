@@ -175,10 +175,11 @@ func DeleteSecurityDescriptor(securityDescriptor *windows.SECURITY_DESCRIPTOR) e
 	setSecurityDescriptor.EnsureInitialized()
 
 	// Pass a function pointer to indicate this was created by FspSetSecurityDescriptor
-	// The C API expects this to match the function that created the descriptor
+	// The C API expects this to match the function that created the descriptor,
+	// and does nothing (leaking the descriptor) if it doesn't.
 	_, err := deleteSecurityDescriptor.Call(
 		uintptr(unsafe.Pointer(securityDescriptor)),
-		uintptr(unsafe.Pointer(setSecurityDescriptor.proc)),
+		setSecurityDescriptor.proc.Addr(),
 	)
 	runtime.KeepAlive(securityDescriptor)
 	if err != nil {
