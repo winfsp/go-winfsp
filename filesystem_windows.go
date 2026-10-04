@@ -1740,16 +1740,10 @@ func Mount(
 
 	if option.debug {
 		// Set debug log level to maximum for debug output
-		_, err = setDebugLogF.Call(
+		_, _ = setDebugLogF.Call(
 			uintptr(unsafe.Pointer(result.fileSystem)),
 			uintptr(math.MaxUint32),
 		)
-		if err == syscall.Errno(0) {
-			err = nil
-		}
-		if err != nil {
-			return nil, errors.Wrap(err, "FspFileSystemSetDebugLogF")
-		}
 	}
 
 	// Attempt to mount the file system at mount point.

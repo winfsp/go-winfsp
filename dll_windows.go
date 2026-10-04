@@ -212,12 +212,15 @@ load error there.
 // only returns one non-error result parameter, instead of two, as no callers require
 // more than one result value.
 //
+// Unlike syscall.Proc.Call, the thread's last-error value is ignored. WinFSP
+// reports failures through return values and NTSTATUS out-params, never
+// through SetLastError. The last error is therefore likely to be junk left
+// behind by some other Windows API call made during it.
+//
 // Additionally, if an arg is the sentinel value ntStatusPtr, it will be replaced
 // with a pointer to a local NTStatus variable to capture the NTStatus return
-// and return it as an error if it's not STATUS_SUCCESS.
-//
-// When the error is non-nil, it's always of type syscall.Errno, like
-// syscall.Proc.Call.
+// and return it as an error if it's not STATUS_SUCCESS. This is the only way
+// Call returns a non-nil error.
 //
 // Every uintptr argument that is really an out-param's address MUST be
 // written as the literal conversion uintptr(unsafe.Pointer(&x)) directly in
@@ -247,15 +250,12 @@ func (p dllProc) Call(args ...uintptr) (uintptr, error) {
 	if statusIdx != -1 {
 		args[statusIdx] = uintptr(unsafe.Pointer(ntStatus))
 	}
-	res1, _, err := p.proc.Call(args...)
+	res1, _, _ := p.proc.Call(args...)
 	runtime.KeepAlive(ntStatus)
-	if err == syscall.Errno(0) {
-		err = nil
+	if statusIdx != -1 && *ntStatus != windows.STATUS_SUCCESS {
+		return res1, *ntStatus
 	}
-	if err == nil && statusIdx != -1 && *ntStatus != windows.STATUS_SUCCESS {
-		err = *ntStatus
-	}
-	return res1, err
+	return res1, nil
 }
 
 // CallStatus is like syscall.Proc.Call1 but is used for procedures that return a
