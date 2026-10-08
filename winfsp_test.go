@@ -112,6 +112,52 @@ func TestMount(t *testing.T) {
 	})
 }
 
+// TestFileInfoTimeout tests that FileInfoTimeout reaches the WinFSP driver.
+// With InfiniteTimeout, WinFSP uses the Windows cache manager for file data,
+// so reading a file twice through one handle reads it from the file system
+// once.
+func TestFileInfoTimeout(t *testing.T) {
+	tests := []struct {
+		name       string
+		mountpoint string
+		opts       []winfsp.Option
+		wantReads  int64
+	}{
+		{"default", "U:", nil, 2},
+		{"infinite", "V:", []winfsp.Option{winfsp.FileInfoTimeout(winfsp.InfiniteTimeout)}, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testFS := newTestFS()
+			contents := bytes.Repeat([]byte{'x'}, 4096)
+			testFS.addTestFile(`\file`, contents)
+			fspFS, err := winfsp.Mount(gofs.New(testFS), tt.mountpoint, tt.opts...)
+			if err != nil {
+				t.Fatalf("Mount: %v", err)
+			}
+			defer fspFS.Unmount()
+
+			f, err := os.Open(tt.mountpoint + `\file`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			buf := make([]byte, len(contents))
+			for range 2 {
+				if _, err := f.ReadAt(buf, 0); err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(buf, contents) {
+					t.Fatal("wrong contents")
+				}
+			}
+			if got := testFS.readAts.Load(); got != tt.wantReads {
+				t.Errorf("file system ReadAt calls = %d; want %d", got, tt.wantReads)
+			}
+		})
+	}
+}
+
 type dirEntMatcher func(t testing.TB, name string, de os.DirEntry)
 
 type WantDir map[string]dirEntMatcher
@@ -213,6 +259,7 @@ func newTestFS() *testFS {
 
 type testFS struct {
 	openFiles atomic.Int64
+	readAts   atomic.Int64 // calls to ReadAt on regular files
 
 	mu    sync.Mutex
 	files map[string][]byte // nil values are directories, else regular file contents
@@ -436,6 +483,7 @@ func (f *winFSPRegularFile) Read(p []byte) (n int, err error) {
 }
 
 func (f *winFSPRegularFile) ReadAt(p []byte, off int64) (n int, err error) {
+	f.fs.readAts.Add(1)
 	n = copy(p, f.contents[min(off, int64(len(f.contents))):])
 	if n == 0 && len(p) > 0 {
 		return 0, io.EOF
