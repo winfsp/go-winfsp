@@ -1365,6 +1365,10 @@ type option struct {
 	debug                    bool
 	sectorSize               uint16
 	sectorsPerAllocationUnit uint16
+	fileInfoTimeout          uint32
+	volumeInfoTimeout        *uint32
+	dirInfoTimeout           *uint32
+	securityTimeout          *uint32
 }
 
 func newOption() *option {
@@ -1463,6 +1467,62 @@ func SectorSize(sectorSize, sectorsPerAllocationUnit uint16) Option {
 	return func(o *option) {
 		o.sectorSize = sectorSize
 		o.sectorsPerAllocationUnit = sectorsPerAllocationUnit
+	}
+}
+
+// InfiniteTimeout is a cache timeout that never expires.
+const InfiniteTimeout time.Duration = -1
+
+// timeoutMillis converts d to the milliseconds WinFSP expects,
+// mapping negative or too large durations to WinFSP's infinity, and
+// rounding up so that only zero means no caching.
+func timeoutMillis(d time.Duration) uint32 {
+	if d < 0 || d >= math.MaxUint32*time.Millisecond {
+		return math.MaxUint32
+	}
+	return uint32((d + time.Millisecond - 1) / time.Millisecond)
+}
+
+// FileInfoTimeout sets how long the WinFSP kernel driver may cache
+// file metadata (attributes, sizes and times) before asking the file
+// system again. It also applies to volume information, directory
+// listings and security descriptors unless they are overridden by
+// VolumeInfoTimeout, DirInfoTimeout or SecurityTimeout.
+//
+// The default is 0, which disables caching. InfiniteTimeout also
+// makes WinFSP use the Windows cache manager for file data, which it
+// does for no other value. Only use it if files never change other
+// than through the mounted volume.
+func FileInfoTimeout(d time.Duration) Option {
+	return func(o *option) {
+		o.fileInfoTimeout = timeoutMillis(d)
+	}
+}
+
+// VolumeInfoTimeout sets how long the WinFSP kernel driver may cache
+// volume information, overriding FileInfoTimeout.
+func VolumeInfoTimeout(d time.Duration) Option {
+	return func(o *option) {
+		v := timeoutMillis(d)
+		o.volumeInfoTimeout = &v
+	}
+}
+
+// DirInfoTimeout sets how long the WinFSP kernel driver may cache
+// directory listings, overriding FileInfoTimeout.
+func DirInfoTimeout(d time.Duration) Option {
+	return func(o *option) {
+		v := timeoutMillis(d)
+		o.dirInfoTimeout = &v
+	}
+}
+
+// SecurityTimeout sets how long the WinFSP kernel driver may cache
+// security descriptors, overriding FileInfoTimeout.
+func SecurityTimeout(d time.Duration) Option {
+	return func(o *option) {
+		v := timeoutMillis(d)
+		o.securityTimeout = &v
 	}
 }
 
@@ -1714,6 +1774,19 @@ func Mount(
 	volumeParams.VolumeCreationTime =
 		*(*uint64)(unsafe.Pointer(&nowFiletime))
 	volumeParams.FileSystemAttribute = attributes
+	volumeParams.FileInfoTimeout = option.fileInfoTimeout
+	if v := option.volumeInfoTimeout; v != nil {
+		volumeParams.VolumeInfoTimeout = *v
+		volumeParams.FileSystemAttribute2 |= FspFSAttribute2VolumeInfoTimeoutValid
+	}
+	if v := option.dirInfoTimeout; v != nil {
+		volumeParams.DirInfoTimeout = *v
+		volumeParams.FileSystemAttribute2 |= FspFSAttribute2DirInfoTimeoutValid
+	}
+	if v := option.securityTimeout; v != nil {
+		volumeParams.SecurityTimeout = *v
+		volumeParams.FileSystemAttribute2 |= FspFSAttribute2SecurityTimeoutValid
+	}
 	copy(volumeParams.Prefix[:], utf16Prefix)
 	copy(volumeParams.FileSystemName[:], utf16Name)
 
