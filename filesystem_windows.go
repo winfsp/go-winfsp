@@ -45,6 +45,7 @@ type FileSystemRef struct {
 	deleteReparsePoint    BehaviourDeleteReparsePoint
 	getReparsePoint       BehaviourGetReparsePoint
 	getReparsePointByName BehaviourGetReparsePointByName
+	getStreamInfo         BehaviourGetStreamInfo
 	setReparsePoint       BehaviourSetReparsePoint
 }
 
@@ -1322,6 +1323,44 @@ var go_delegateResolveReparsePoints = syscall.NewCallbackCDecl(func(
 	))
 })
 
+// BehaviourGetStreamInfo lists a file's streams (named streams,
+// FILE_STREAM_INFORMATION / FindFirstStreamW), filling buf with
+// FileSystemAddStreamInfo entries and a FileSystemAddStreamInfoEnd
+// terminator, and returning the bytes used. Implementing it marks the
+// volume as supporting named streams (FspFSAttributeNamedStreams): the
+// file system then receives names of the form "\path\file:stream" in
+// Create, Open and the other by-name operations.
+type BehaviourGetStreamInfo interface {
+	GetStreamInfo(fs *FileSystemRef, file uintptr, buf []byte) (int, error)
+}
+
+func delegateGetStreamInfo(
+	fileSystem, fileContext uintptr,
+	buf uintptr, length uint32, bytesTransferred *uint32,
+) windows.NTStatus {
+	ref := loadFileSystemRef(fileSystem)
+	if ref == nil {
+		return ntStatusNoRef
+	}
+	n, err := ref.getStreamInfo.GetStreamInfo(
+		ref, fileContext, enforceBytePtr(buf, int(length)))
+	if err != nil {
+		return convertNTStatus(err)
+	}
+	*bytesTransferred = uint32(n)
+	return windows.STATUS_SUCCESS
+}
+
+var go_delegateGetStreamInfo = syscall.NewCallbackCDecl(func(
+	fileSystem, fileContext uintptr,
+	buf uintptr, length uint32, bytesTransferred *uint32,
+) uintptr {
+	return uintptr(delegateGetStreamInfo(
+		fileSystem, fileContext,
+		buf, length, bytesTransferred,
+	))
+})
+
 // BehaviourSetReparsePoint sets a reparse point.
 type BehaviourSetReparsePoint interface {
 	SetReparsePoint(
@@ -1684,6 +1723,11 @@ func Mount(
 		attributes |= FspFSAttributeReparsePoints
 		fileSystemRef.getReparsePointByName = inner
 		fileSystemOps.ResolveReparsePoints = go_delegateResolveReparsePoints
+	}
+	if inner, ok := fs.(BehaviourGetStreamInfo); ok {
+		attributes |= FspFSAttributeNamedStreams
+		fileSystemRef.getStreamInfo = inner
+		fileSystemOps.GetStreamInfo = go_delegateGetStreamInfo
 	}
 	if inner, ok := fs.(BehaviourSetReparsePoint); ok {
 		fileSystemRef.setReparsePoint = inner

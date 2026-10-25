@@ -84,3 +84,43 @@ func FileSystemAddDirInfo(
 
 	return int(alignedSize)
 }
+
+// streamInfoHeaderSize is FSP_FSCTL_STREAM_INFO's fixed part: Size
+// (UINT16, padded to 8), StreamSize and StreamAllocationSize (UINT64
+// each), followed by the WCHAR name.
+const streamInfoHeaderSize = 24
+
+// FileSystemAddStreamInfo adds one stream's information to a
+// GetStreamInfo buffer like FspFileSystemAddStreamInfo: name is the
+// stream name without the leading colon or ":$DATA" ("" = the main,
+// unnamed stream). It returns the bytes written, or 0 if the entry does
+// not fit. Finish the buffer with FileSystemAddStreamInfoEnd.
+func FileSystemAddStreamInfo(name string, size, allocationSize uint64, buffer []byte) int {
+	encoded := utf16.Encode([]rune(name))
+	requiredSize := streamInfoHeaderSize + len(encoded)*SIZEOF_WCHAR
+	alignedSize := (requiredSize + int(dirInfoAlignment) - 1) &^ (int(dirInfoAlignment) - 1)
+	if len(buffer) < alignedSize {
+		return 0
+	}
+	*(*uint16)(unsafe.Pointer(&buffer[0])) = uint16(requiredSize)
+	for i := 2; i < 8; i++ {
+		buffer[i] = 0
+	}
+	*(*uint64)(unsafe.Pointer(&buffer[8])) = size
+	*(*uint64)(unsafe.Pointer(&buffer[16])) = allocationSize
+	for i, c := range encoded {
+		*(*uint16)(unsafe.Pointer(&buffer[streamInfoHeaderSize+i*SIZEOF_WCHAR])) = c
+	}
+	return alignedSize
+}
+
+// FileSystemAddStreamInfoEnd terminates a GetStreamInfo buffer, like
+// FspFileSystemAddStreamInfo with a NULL StreamInfo. It returns the
+// bytes written, or 0 if there is no room.
+func FileSystemAddStreamInfoEnd(buffer []byte) int {
+	if len(buffer) < 2 {
+		return 0
+	}
+	buffer[0], buffer[1] = 0, 0
+	return 2
+}
