@@ -84,3 +84,32 @@ func FileSystemAddDirInfo(
 
 	return int(alignedSize)
 }
+
+// GetOpenFileInfo is FspFileSystemGetOpenFileInfo: the FileInfo passed
+// to Create and Open really points to an FSP_FSCTL_OPEN_FILE_INFO, whose
+// extra fields let the file system report the normalized (correctly
+// cased) file name. info must be the pointer passed to Create or Open,
+// never one from any other operation.
+func GetOpenFileInfo(info *FSP_FSCTL_FILE_INFO) *FSP_FSCTL_OPEN_FILE_INFO {
+	return (*FSP_FSCTL_OPEN_FILE_INFO)(unsafe.Pointer(info))
+}
+
+// SetNormalizedName reports the opened file's normalized name: the path
+// as opened, differing from it only in case, without a terminating zero.
+// Without it, a case-insensitive volume reports the upper-cased name
+// used to open the file (e.g. through GetFinalPathNameByHandle or
+// FileNameInformation). It reports false, setting nothing, if name
+// doesn't fit the buffer WinFsp provided.
+func (o *FSP_FSCTL_OPEN_FILE_INFO) SetNormalizedName(name string) bool {
+	if o.NormalizedName == nil {
+		return false
+	}
+	encoded := utf16.Encode([]rune(name))
+	size := len(encoded) * SIZEOF_WCHAR
+	if size > int(o.NormalizedNameSize) {
+		return false
+	}
+	copy(unsafe.Slice(o.NormalizedName, len(encoded)), encoded)
+	o.NormalizedNameSize = uint16(size)
+	return true
+}
